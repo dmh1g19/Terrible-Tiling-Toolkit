@@ -177,7 +177,12 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
       , h1_ [ style_ headerStyle ] [ text "DSL Editor" ]
       , textarea_
           [ onInput DSLInputChanged
-          , style_ (mconcat [ "width" =: "100%", "height" =: "200px", "margin-bottom" =: "10px", "padding" =: "10px", "font-size" =: "14px" ])
+          , style_ (mconcat [ "width" =: "100%"
+                           , "height" =: "200px"
+                           , "margin-bottom" =: "10px"
+                           , "padding" =: "10px"
+                           , "font-size" =: "14px"
+                           ])
           ]
           [ text dslInput ]
       , button_ [ onClick EvaluateDSL, style_ buttonStyle ] [ text "Evaluate DSL" ]
@@ -192,7 +197,9 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
       ]
   , div_ [ style_ rightColumnStyle ]
       [ h1_ [ style_ headerStyle ] [ text "Tile Output:" ]
-      , TileView.viewTileSVG (concatMap splitNewlines output)
+      , if not (null output) && ("Error:" `JS.isPrefixOf` head output)
+           then div_ [ style_ errorStyle ] [ text (head output) ]
+           else TileView.viewTileSVG (concatMap splitNewlines output)
       ]
   ]
   where
@@ -262,3 +269,7 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
                   ]
                   [ text "Remove" ]
         ]
+    errorStyle = mconcat [ "color" =: "red"
+                         , "font-weight" =: "bold"
+                         , "padding" =: "10px"
+                         ]
