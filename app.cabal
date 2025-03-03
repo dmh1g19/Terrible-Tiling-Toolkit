@@ -12,5 +12,5 @@ executable app
   hs-source-dirs:      .
   build-depends:       base, miso, array, deepseq, ghcjs-base
   build-tools:         happy, alex
-  other-modules:       Evaluator, Grammar, Tokens, Tsl, TileView
+  other-modules:       Evaluator, Grammar, Tokens, Tsl, TileView, Examples
   default-language:    Haskell2010
