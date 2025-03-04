@@ -1,2 +1,5 @@
 result
 dist-newstyle
+.firebase/
+firebase.json
+.firebaserc
