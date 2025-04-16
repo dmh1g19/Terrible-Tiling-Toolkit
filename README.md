@@ -1,5 +1,5 @@
 # The Terrible Tiling Toolkit (TTTT)
-A relatively pointless language used to experiment with writting persers in Haskell! 
+A relatively pointless language used to experiment with writing parsers in Haskell! 
 
 Based on our uni group project: https://github.com/dmh1g19/Tiling-Language
 
