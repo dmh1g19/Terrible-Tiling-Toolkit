@@ -41,6 +41,7 @@ data Model = Model
   , isDragging   :: Bool
   , lastMouseX   :: Float
   , lastMouseY   :: Float
+  , isLoading    :: Bool
   } deriving (Show, Eq)
 
 -- ---------------------------------------------------------------------------
@@ -121,6 +122,7 @@ main = startApp App
       , isDragging   = False
       , lastMouseX   = 0
       , lastMouseY   = 0
+      , isLoading    = False
       }
   , update     = updateModel
   , view       = viewModel
@@ -157,7 +159,7 @@ updateModel (SelectExample exName) m =
                        }
     Nothing -> noEff m
 
-updateModel EvaluateDSL m = m <# do
+updateModel EvaluateDSL m = m { isLoading = True } <# do
   let code     = JS.unpack (dslInput m)
       tileData = map (\(n, s) -> (JS.unpack n, JS.unpack s)) (tileInputs m)
   result <- try (evaluate (force (runTslInBrowser code tileData)))
@@ -168,8 +170,8 @@ updateModel EvaluateDSL m = m <# do
 
 updateModel (DSLResult res) m =
   case res of
-    Left errMsg -> noEff m { output = ["Error: " <> errMsg] }
-    Right outs  -> noEff m { output = outs
+    Left errMsg -> noEff m { output = ["Error: " <> errMsg], isLoading = False }
+    Right outs  -> noEff m { output = outs, isLoading = False
                            , vpZoom = 1.0, vpPanX = 0.0, vpPanY = 0.0
                            }
 
@@ -271,9 +273,11 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
                   [ text "Reset" ]
               ]
           ]
-      , if not (null output) && ("Error:" `JS.isPrefixOf` head output)
-          then div_ [ style_ errorStyle ] [ text (head output) ]
-          else viewportContainer output vpZoom vpPanX vpPanY isDragging
+      , if isLoading
+          then loadingIndicator
+          else if not (null output) && ("Error:" `JS.isPrefixOf` head output)
+            then div_ [ style_ errorStyle ] [ text (head output) ]
+            else viewportContainer output vpZoom vpPanX vpPanY isDragging
       ]
   ]
   where
@@ -310,6 +314,33 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
                             , "border-radius" =: "4px" ]
     errorStyle    = mconcat [ "color" =: "red", "font-weight" =: "bold"
                             , "padding" =: "10px" ]
+
+    loadingIndicator :: View Action
+    loadingIndicator =
+      div_ [ style_ (mconcat [ "flex" =: "1"
+                              , "display" =: "flex"
+                              , "flex-direction" =: "column"
+                              , "justify-content" =: "center"
+                              , "align-items" =: "center"
+                              , "border" =: "1px solid #ccc"
+                              , "border-radius" =: "6px"
+                              , "background-color" =: "#fafafa"
+                              , "min-height" =: "300px"
+                              ]) ]
+        [ div_ [ style_ (mconcat [ "width" =: "40px"
+                                  , "height" =: "40px"
+                                  , "border" =: "4px solid #e0e0e0"
+                                  , "border-top" =: "4px solid #3498db"
+                                  , "border-radius" =: "50%"
+                                  , "animation" =: "spin 0.8s linear infinite"
+                                  , "margin-bottom" =: "16px"
+                                  ]) ] []
+        , span_ [ style_ (mconcat [ "color" =: "#666"
+                                   , "font-size" =: "14px" ]) ]
+            [ text "Evaluating DSL..." ]
+        , node HTML (ms ("style" :: String)) Nothing []
+            [ text "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }" ]
+        ]
 
     defaultOption = option_ [ value_ "" ] [ text "Select an example" ]
 
