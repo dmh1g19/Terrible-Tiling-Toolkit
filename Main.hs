@@ -34,10 +34,10 @@ data Model = Model
   , tileInputs   :: [(MisoString, MisoString)]
   , newTileName  :: MisoString
   , newTileShape :: MisoString
-  -- Viewport state
-  , vpZoom       :: Float
-  , vpPanX       :: Float
-  , vpPanY       :: Float
+  -- Viewport (CSS-transform based — values are in screen pixels)
+  , vpZoom       :: Float   -- 1.0 = content fits container
+  , vpPanX       :: Float   -- horizontal shift in px
+  , vpPanY       :: Float   -- vertical shift in px
   , isDragging   :: Bool
   , lastMouseX   :: Float
   , lastMouseY   :: Float
@@ -61,7 +61,7 @@ data Action
   | StartDrag Float Float
   | DragMove  Float Float
   | StopDrag
-  | WheelZoom Float
+  | WheelZoom Float Float Float   -- deltaY, offsetX, offsetY
   | ResetViewport
   deriving (Show, Eq)
 
@@ -78,29 +78,29 @@ mousePositionDecoder = Decoder
       return (x, y)
   }
 
-wheelDeltaDecoder :: Decoder Float
-wheelDeltaDecoder = Decoder
+-- | Decodes deltaY and the mouse offset within the target element,
+--   so we can zoom towards the cursor position.
+wheelDecoder :: Decoder (Float, Float, Float)
+wheelDecoder = Decoder
   { decodeAt = DecodeTarget mempty
-  , decoder  = withObject "WheelEvent" $ \o -> o .: "deltaY"
+  , decoder  = withObject "WheelEvent" $ \o -> do
+      dy <- o .: "deltaY"
+      ox <- o .: "offsetX"
+      oy <- o .: "offsetY"
+      return (dy, ox, oy)
   }
 
 -- ---------------------------------------------------------------------------
--- Zoom / pan constants
+-- Zoom constants
 -- ---------------------------------------------------------------------------
 
 zoomMin, zoomMax, zoomFactor :: Float
-zoomMin    = 0.1
+zoomMin    = 0.2
 zoomMax    = 30.0
 zoomFactor = 1.1
 
 clampZoom :: Float -> Float
 clampZoom z = max zoomMin (min zoomMax z)
-
--- Heuristic: assume the SVG container is ~600 px wide at zoom 1.
-panScale :: Float -> (Float, Float) -> (Float, Float)
-panScale zoom (cw, ch) =
-  let base = max cw ch / 600.0
-  in (base / zoom, base / zoom)
 
 -- ---------------------------------------------------------------------------
 -- Entry point
@@ -122,10 +122,10 @@ main = startApp App
       , lastMouseX   = 0
       , lastMouseY   = 0
       }
-  , update    = updateModel
-  , view      = viewModel
-  , events    = defaultEvents
-  , subs      = []
+  , update     = updateModel
+  , view       = viewModel
+  , events     = defaultEvents
+  , subs       = []
   , mountPoint = Nothing
   }
 
@@ -135,9 +135,9 @@ main = startApp App
 
 updateModel :: Action -> Model -> Effect Action Model
 
-updateModel (DSLInputChanged newInput) m = noEff m { dslInput = newInput }
-updateModel (NewTileNameChanged n) m     = noEff m { newTileName = n }
-updateModel (NewTileShapeChanged s) m    = noEff m { newTileShape = s }
+updateModel (DSLInputChanged v) m = noEff m { dslInput = v }
+updateModel (NewTileNameChanged v) m = noEff m { newTileName = v }
+updateModel (NewTileShapeChanged v) m = noEff m { newTileShape = v }
 
 updateModel AddTile m =
   noEff m { tileInputs = tileInputs m ++ [(newTileName m, newTileShape m)]
@@ -175,46 +175,40 @@ updateModel (DSLResult res) m =
 
 updateModel NoOp m = noEff m
 
--- Viewport: start drag ---------------------------------------------------
+-- Start drag ---------------------------------------------------------------
 updateModel (StartDrag mx my) m =
   noEff m { isDragging = True, lastMouseX = mx, lastMouseY = my }
 
--- Viewport: drag (pan) ---------------------------------------------------
+-- Drag (pan) — direct pixel mapping, no scaling needed --------------------
 updateModel (DragMove mx my) m
   | not (isDragging m) = noEff m
   | otherwise =
-    let tileData = concatMap splitNewlines (output m)
-        cSize    = TileView.tileContentSize tileData
-        (sx, sy) = panScale (vpZoom m) cSize
-        dx       = (mx - lastMouseX m) * sx
-        dy       = (my - lastMouseY m) * sy
-    in noEff m { vpPanX = vpPanX m - dx
-               , vpPanY = vpPanY m - dy
-               , lastMouseX = mx
-               , lastMouseY = my
-               }
+    noEff m { vpPanX = vpPanX m + (mx - lastMouseX m)
+            , vpPanY = vpPanY m + (my - lastMouseY m)
+            , lastMouseX = mx
+            , lastMouseY = my
+            }
 
--- Viewport: stop drag -----------------------------------------------------
+-- Stop drag ----------------------------------------------------------------
 updateModel StopDrag m = noEff m { isDragging = False }
 
--- Viewport: wheel zoom (keeps view centre stable) -------------------------
-updateModel (WheelZoom deltaY) m =
-  let tileData = concatMap splitNewlines (output m)
-      (cw, ch) = TileView.tileContentSize tileData
-      oldZ     = vpZoom m
-      newZ     = clampZoom $ if deltaY < 0
-                               then oldZ * zoomFactor
-                               else oldZ / zoomFactor
-      oldVBW   = cw / oldZ;  oldVBH = ch / oldZ
-      newVBW   = cw / newZ;  newVBH = ch / newZ
-      cx       = vpPanX m + oldVBW / 2
-      cy       = vpPanY m + oldVBH / 2
-  in noEff m { vpZoom = newZ
-             , vpPanX = cx - newVBW / 2
-             , vpPanY = cy - newVBH / 2
-             }
+-- Wheel zoom — zoom towards cursor position -------------------------------
+--   offsetX/Y is the cursor position within the container.
+--   Formula: keep the SVG point under the cursor stationary.
+--     screenPt = pan + offset           (not scaled, it's the div-local pos)
+--     svgFrac  = (offset - pan) / zoom  (point in "unzoomed" SVG space)
+--     After zoom:  newPan = offset - svgFrac * newZoom
+updateModel (WheelZoom deltaY ox oy) m =
+  let oldZ  = vpZoom m
+      newZ  = clampZoom $ if deltaY < 0
+                            then oldZ * zoomFactor
+                            else oldZ / zoomFactor
+      -- Keep the point under the cursor fixed
+      newPX = ox - (ox - vpPanX m) * (newZ / oldZ)
+      newPY = oy - (oy - vpPanY m) * (newZ / oldZ)
+  in noEff m { vpZoom = newZ, vpPanX = newPX, vpPanY = newPY }
 
--- Viewport: reset ---------------------------------------------------------
+-- Reset --------------------------------------------------------------------
 updateModel ResetViewport m =
   noEff m { vpZoom = 1.0, vpPanX = 0.0, vpPanY = 0.0 }
 
@@ -257,12 +251,11 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
           ]
       ]
   , div_ [ style_ rightColumnStyle ]
-      [ -- toolbar: title + zoom controls
+      [ -- Toolbar
         div_ [ style_ (mconcat [ "display" =: "flex"
                                 , "justify-content" =: "space-between"
                                 , "align-items" =: "center"
-                                , "margin-bottom" =: "8px"
-                                ]) ]
+                                , "margin-bottom" =: "8px" ]) ]
           [ h1_ [ style_ headerStyle ] [ text "Tile Output:" ]
           , div_ [ style_ (mconcat [ "display" =: "flex"
                                    , "gap" =: "6px"
@@ -270,9 +263,9 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
               [ span_ [ style_ (mconcat [ "font-size" =: "13px"
                                         , "color" =: "#888" ]) ]
                   [ text (ms (show (round (vpZoom * 100) :: Int) ++ "%")) ]
-              , button_ [ onClick (WheelZoom (-1)), style_ smallBtnStyle ]
+              , button_ [ onClick (WheelZoom (-120) 300 200), style_ smallBtnStyle ]
                   [ text "+" ]
-              , button_ [ onClick (WheelZoom 1), style_ smallBtnStyle ]
+              , button_ [ onClick (WheelZoom 120 300 200), style_ smallBtnStyle ]
                   [ text "\x2212" ]
               , button_ [ onClick ResetViewport, style_ smallBtnStyle ]
                   [ text "Reset" ]
@@ -280,12 +273,10 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
           ]
       , if not (null output) && ("Error:" `JS.isPrefixOf` head output)
           then div_ [ style_ errorStyle ] [ text (head output) ]
-          else viewportContainer output vpCfg isDragging
+          else viewportContainer output vpZoom vpPanX vpPanY isDragging
       ]
   ]
   where
-    vpCfg = TileView.ViewportConfig vpZoom vpPanX vpPanY
-
     containerStyle = mconcat
       [ "display" =: "flex", "flex-direction" =: "row"
       , "font-family" =: "Arial, sans-serif", "height" =: "100vh" ]
@@ -297,16 +288,16 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
     rightColumnStyle = mconcat
       [ "width" =: "50%", "padding" =: "20px"
       , "display" =: "flex", "flex-direction" =: "column" ]
-    headerStyle  = mconcat [ "color" =: "#333", "margin-bottom" =: "10px" ]
-    inputStyle   = mconcat [ "padding" =: "8px", "margin-right" =: "10px"
-                           , "border" =: "1px solid #ccc"
-                           , "border-radius" =: "4px" ]
-    buttonStyle  = mconcat [ "padding" =: "10px 15px"
-                           , "background-color" =: "#3498db"
-                           , "color" =: "white", "border" =: "none"
-                           , "border-radius" =: "4px"
-                           , "cursor" =: "pointer"
-                           , "margin-right" =: "10px" ]
+    headerStyle   = mconcat [ "color" =: "#333", "margin-bottom" =: "10px" ]
+    inputStyle    = mconcat [ "padding" =: "8px", "margin-right" =: "10px"
+                            , "border" =: "1px solid #ccc"
+                            , "border-radius" =: "4px" ]
+    buttonStyle   = mconcat [ "padding" =: "10px 15px"
+                            , "background-color" =: "#3498db"
+                            , "color" =: "white", "border" =: "none"
+                            , "border-radius" =: "4px"
+                            , "cursor" =: "pointer"
+                            , "margin-right" =: "10px" ]
     smallBtnStyle = mconcat [ "padding" =: "4px 10px"
                             , "background-color" =: "#3498db"
                             , "color" =: "white", "border" =: "none"
@@ -317,8 +308,8 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
                             , "margin-bottom" =: "20px"
                             , "border" =: "1px solid #ccc"
                             , "border-radius" =: "4px" ]
-    errorStyle = mconcat [ "color" =: "red", "font-weight" =: "bold"
-                         , "padding" =: "10px" ]
+    errorStyle    = mconcat [ "color" =: "red", "font-weight" =: "bold"
+                            , "padding" =: "10px" ]
 
     defaultOption = option_ [ value_ "" ] [ text "Select an example" ]
 
@@ -341,32 +332,45 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
         , button_ [ onClick (RemoveTile idx)
                   , style_ (mconcat [ "padding" =: "5px 10px"
                                     , "background-color" =: "#e74c3c"
-                                    , "color" =: "white"
-                                    , "border" =: "none"
+                                    , "color" =: "white", "border" =: "none"
                                     , "border-radius" =: "4px"
                                     , "cursor" =: "pointer" ]) ]
             [ text "Remove" ]
         ]
 
--- | SVG viewport wrapper with mouse / wheel event handlers.
-viewportContainer :: [MisoString] -> TileView.ViewportConfig -> Bool -> View Action
-viewportContainer outputLines vpCfg dragging =
-  let tileData    = concatMap splitNewlines outputLines
-      cursorVal   = if dragging then "grabbing" else "grab" :: String
-      svgEvents   =
-        [ on "mousedown"  mousePositionDecoder (\(x,y) -> StartDrag x y)
-        , on "mousemove"  mousePositionDecoder (\(x,y) -> DragMove  x y)
-        , on "mouseup"    mousePositionDecoder (\_ -> StopDrag)
-        , on "mouseleave" mousePositionDecoder (\_ -> StopDrag)
-        , onWithOptions (defaultOptions { preventDefault = True })
-            "wheel" wheelDeltaDecoder WheelZoom
-        ]
-  in div_ [ style_ (mconcat [ "flex" =: "1"
-                             , "border" =: "1px solid #ccc"
-                             , "border-radius" =: "6px"
-                             , "overflow" =: "hidden"
-                             , "cursor" =: ms cursorVal
-                             , "user-select" =: "none"
-                             , "min-height" =: "300px"
-                             , "background-color" =: "#fafafa" ]) ]
-       [ TileView.viewTileSVG tileData vpCfg svgEvents ]
+-- | The viewport container.  The SVG content is rendered ONCE inside a
+--   wrapper div.  Only the wrapper's CSS `transform` property changes on
+--   zoom/pan — the browser GPU-accelerates this without re-laying-out the
+--   thousands of SVG <rect> elements.
+viewportContainer :: [MisoString] -> Float -> Float -> Float -> Bool -> View Action
+viewportContainer outputLines zoom panX panY dragging =
+  let tileData   = concatMap splitNewlines outputLines
+      cursorVal  = if dragging then "grabbing" else "grab" :: String
+      transformV = ms $ "translate(" ++ show panX ++ "px," ++ show panY ++ "px) "
+                     ++ "scale(" ++ show zoom ++ ")"
+  in div_
+       [ style_ (mconcat [ "flex" =: "1"
+                          , "border" =: "1px solid #ccc"
+                          , "border-radius" =: "6px"
+                          , "overflow" =: "hidden"
+                          , "position" =: "relative"
+                          , "cursor" =: ms cursorVal
+                          , "user-select" =: "none"
+                          , "min-height" =: "300px"
+                          , "background-color" =: "#fafafa"
+                          ])
+       , on "mousedown"  mousePositionDecoder (\(x,y) -> StartDrag x y)
+       , on "mousemove"  mousePositionDecoder (\(x,y) -> DragMove  x y)
+       , on "mouseup"    mousePositionDecoder (\_ -> StopDrag)
+       , on "mouseleave" mousePositionDecoder (\_ -> StopDrag)
+       , onWithOptions (defaultOptions { preventDefault = True })
+           "wheel" wheelDecoder (\(dy,ox,oy) -> WheelZoom dy ox oy)
+       ]
+       [ div_ [ style_ (mconcat [ "width" =: "100%"
+                                 , "height" =: "100%"
+                                 , "transform-origin" =: "0 0"
+                                 , "transform" =: transformV
+                                 , "will-change" =: "transform"
+                                 ]) ]
+           [ TileView.viewTileSVG tileData ]
+       ]
