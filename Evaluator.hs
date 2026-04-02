@@ -1,353 +1,321 @@
+{-# LANGUAGE BangPatterns #-}
 module Evaluator where
 
 import Control.DeepSeq
-import Control.Monad
-import Data.List
+import Data.List (intercalate, transpose)
+import qualified Data.Map.Strict as Map
 import Grammar
 
--- Environment now stores TileVars directly without IO
-type Environment = ([(String, TileVar)], [(String, Int)])
+-- Use strict Maps for O(log n) lookup/insert instead of O(n) association lists
+type TileEnv = Map.Map String TileVar
+type IntEnv  = Map.Map String Int
+type Environment = (TileEnv, IntEnv)
 
--- State includes expressions, environment, and accumulated output
+-- State includes expressions, environment, and accumulated output (reversed)
 type State = ([Exp], Environment, [String])
 
-data TileVar = Tile [String]
+data TileVar = Tile ![String]
   deriving (Show, Eq)
+
+instance NFData TileVar where
+  rnf (Tile xs) = rnf xs
 
 -- Evaluate expressions and return final state with output
 evaluateExp :: State -> State
-evaluateExp state@([], env, output) = state
+evaluateExp state@([], _, _) = state
+
 evaluateExp ((ExpReturn tile1) : xs, env, output) =
-  let (newTile1, env') = evaluateExpTile (tile1, env)
-      newOutput = output ++ [prettyPrint newTile1]
-   in (xs, env', newOutput)
-evaluateExp ((ExpDoNothing : xs), env, output) = evaluateExp (xs, env, output)
+  let !(newTile1, env') = evaluateExpTile (tile1, env)
+  in (xs, env', prettyPrint newTile1 : output)
+
+evaluateExp (ExpDoNothing : xs, env, output) =
+  evaluateExp (xs, env, output)
+
 evaluateExp ((MultiExpr exp1 exp2) : xs, env, output) =
   evaluateExp (exp1 : exp2 : xs, env, output)
+
 evaluateExp ((ExpIf bool1 exp1 exp2) : xs, env, output)
-  | newBool1 = evaluateExp (exp1 : xs, env, output)
-  | otherwise = evaluateExp (exp2 : xs, env, output)
-  where
-    newBool1 = evaluateExpBool (bool1, env)
+  | evaluateExpBool (bool1, env) = evaluateExp (exp1 : xs, env, output)
+  | otherwise                    = evaluateExp (exp2 : xs, env, output)
+
 evaluateExp ((ExpWhile bool1 exp1) : xs, env, output)
-  | newBool1 = evaluateExp (exp1 : exp : xs, env, output)
+  | evaluateExpBool (bool1, env) =
+      evaluateExp (exp1 : ExpWhile bool1 exp1 : xs, env, output)
   | otherwise = evaluateExp (xs, env, output)
-  where
-    newBool1 = evaluateExpBool (bool1, env)
-    exp = ExpWhile bool1 exp1
+
 evaluateExp ((ExpPrint tile1) : xs, env, output) =
-  let (newTile1, env') = evaluateExpTile (tile1, env)
-      newOutput = output ++ [prettyPrint newTile1]
-   in evaluateExp (xs, env', newOutput)
+  let !(newTile1, env') = evaluateExpTile (tile1, env)
+  in evaluateExp (xs, env', prettyPrint newTile1 : output)
+
 evaluateExp ((ExpSetTileVar name tile1) : xs, env, output) =
-  let (newTile1, env') = evaluateExpTile (tile1, env)
-      env'' = addTileVar name newTile1 env'
-   in evaluateExp (xs, env'', output)
+  let !(newTile1, env') = evaluateExpTile (tile1, env)
+      !env'' = addTileVar name newTile1 env'
+  in evaluateExp (xs, env'', output)
+
 evaluateExp ((ExpSetIntVar name int1) : xs, env, output) =
-  let newInt1 = evaluateExpInt (int1, env)
-      env' = addIntVar name newInt1 env
-   in evaluateExp (xs, env', output)
+  let !newInt1 = evaluateExpInt (int1, env)
+      !env' = addIntVar name newInt1 env
+  in evaluateExp (xs, env', output)
 
--- Pure version of getTileVar and helpers
+-- ---------------------------------------------------------------------------
+-- Environment operations — O(log n) with Data.Map.Strict
+-- ---------------------------------------------------------------------------
+
 getTileVar :: String -> Environment -> TileVar
-getTileVar name (tiles, ints) =
-  case lookup name tiles of
+getTileVar name (tiles, _) =
+  case Map.lookup name tiles of
     Just tile -> tile
-    Nothing -> error $ "Tile variable not found: " ++ name
+    Nothing   -> error $ "Tile variable not found: " ++ name
 
--- Replaces the original get tile from file function
 addTileVar :: String -> TileVar -> Environment -> Environment
-addTileVar name tile (tiles, ints) =
-  ((name, tile) : filter ((/= name) . fst) tiles, ints)
+addTileVar name !tile (tiles, ints) =
+  (Map.insert name tile tiles, ints)
 
--- Evaluate Tile expressions purely
--- TODO: Implement this
-evaluateExpTile :: (ExpTile, Environment) -> (TileVar, Environment)
--- Look up a tile variable
-evaluateExpTile (TileVar name, env) =
-  (getTileVar name env, env)
--- Combine two tiles side by side (to the right)
-evaluateExpTile (TileCTR tile1 tile2, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-      (newTile2, env2) = evaluateExpTile (tile2, env1)
-   in (combineTilesRight newTile1 newTile2, env2)
--- Combine two tiles one on top of the other (downward)
-evaluateExpTile (TileCTD tile1 tile2, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-      (newTile2, env2) = evaluateExpTile (tile2, env1)
-   in (combineTilesDown newTile1 newTile2, env2)
--- Duplicate a tile to the right a given number of times
-evaluateExpTile (TileDTR tile1 int1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-      newInt1 = evaluateExpInt (int1, env1)
-   in (duplicateTileRight newTile1 newInt1, env1)
--- Duplicate a tile downward a given number of times
-evaluateExpTile (TileDTD tile1 int1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-      newInt1 = evaluateExpInt (int1, env1)
-   in (duplicateTileDown newTile1 newInt1, env1)
--- Rotate a tile 90 degrees
-evaluateExpTile (TileRT90 tile1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-   in (rotateTile90Degrees newTile1, env1)
--- Rotate a tile 180 degrees
-evaluateExpTile (TileRT180 tile1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-   in (rotateTile180Degrees newTile1, env1)
--- Rotate a tile 270 degrees
-evaluateExpTile (TileRT270 tile1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-   in (rotateTile270Degrees newTile1, env1)
--- Square rotate a tile
-evaluateExpTile (TileSRT tile1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-   in (squareRotateTile newTile1, env1)
--- Scale a tile by an integer factor
-evaluateExpTile (TileST tile1 int1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-      newInt1 = evaluateExpInt (int1, env1)
-   in (scaleTile newTile1 newInt1, env1)
--- Create a blank tile based on an existing tile
-evaluateExpTile (TileCBT tile1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-   in (createBlankTile newTile1, env1)
--- Reflect a tile across the X axis
-evaluateExpTile (TileRTX tile1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-   in (reflectTileX newTile1, env1)
--- Reflect a tile across the Y axis
-evaluateExpTile (TileRTY tile1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-   in (reflectTileY newTile1, env1)
--- Reflect a tile across the line Y = X
-evaluateExpTile (TileRTXY tile1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-   in (reflectTileXY newTile1, env1)
--- Create a sub-tile from a tile using four integer parameters
-evaluateExpTile (TileSub tile1 int1 int2 int3 int4, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-      newInt1 = evaluateExpInt (int1, env1)
-      newInt2 = evaluateExpInt (int2, env1)
-      newInt3 = evaluateExpInt (int3, env1)
-      newInt4 = evaluateExpInt (int4, env1)
-   in (createSubTile newTile1 newInt1 newInt2 newInt3 newInt4, env1)
--- Conjunct (combine) two tiles in some specified way
-evaluateExpTile (TileConjunct tile1 tile2, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-      (newTile2, env2) = evaluateExpTile (tile2, env1)
-   in (conjunctTiles newTile1 newTile2, env2)
--- Negate (or invert) a tile's content
-evaluateExpTile (TileNegate tile1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-   in (negateTile newTile1, env1)
--- Remove the top n lines from a tile
-evaluateExpTile (TileRemoveTop tile1 int1, env) =
-  let (newTile1, env1) = evaluateExpTile (tile1, env)
-      newInt1 = evaluateExpInt (int1, env1)
-   in (removeTop newTile1 newInt1, env1)
-
--- Functions for adding/getting int variables
 addIntVar :: String -> Int -> Environment -> Environment
-addIntVar name int (tiles, ints)
-  | variableNameExists name ints = (tiles, (replaceIntVar name int ints))
-  | otherwise = (tiles, (name, int) : ints)
+addIntVar name !val (tiles, ints) =
+  (tiles, Map.insert name val ints)
 
 getIntVar :: String -> Environment -> Int
-getIntVar name (tiles, ints)
-  | variableNameExists name ints = getIntVariable name ints
-  | otherwise = error ("Error: Variable name for integers: " ++ name ++ " does not exist")
+getIntVar name (_, ints) =
+  case Map.lookup name ints of
+    Just val -> val
+    Nothing  -> error $ "Error: Variable name for integers: "
+                     ++ name ++ " does not exist"
 
-getIntVariable :: String -> [(String, Int)] -> Int
-getIntVariable name ((var, int) : xs)
-  | name == var = int
-  | otherwise = getIntVariable name xs
+-- ---------------------------------------------------------------------------
+-- Tile expression evaluation
+-- ---------------------------------------------------------------------------
 
-replaceIntVar :: String -> Int -> [(String, Int)] -> [(String, Int)]
-replaceIntVar name int ((var, intvar) : xs)
-  | name == var = (name, int) : xs
-  | otherwise = (var, intvar) : replaceIntVar name int xs
+-- | Force the tile result deeply to avoid thunk chains in GHCJS.
+--   Without this, each operation wraps its result in lazy thunks that
+--   pile up and get forced all at once later — very slow under GHCJS.
+strictResult :: TileVar -> Environment -> (TileVar, Environment)
+strictResult !t !e = force t `seq` (t, e)
+{-# INLINE strictResult #-}
 
--- Evaluates an integer expression to an integer
+evaluateExpTile :: (ExpTile, Environment) -> (TileVar, Environment)
+
+evaluateExpTile (TileVar name, env) =
+  (getTileVar name env, env)
+
+evaluateExpTile (TileCTR tile1 tile2, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+      !(t2, env2) = evaluateExpTile (tile2, env1)
+  in strictResult (combineTilesRight t1 t2) env2
+
+evaluateExpTile (TileCTD tile1 tile2, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+      !(t2, env2) = evaluateExpTile (tile2, env1)
+  in strictResult (combineTilesDown t1 t2) env2
+
+evaluateExpTile (TileDTR tile1 int1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+      !n = evaluateExpInt (int1, env1)
+  in strictResult (duplicateTileRight t1 n) env1
+
+evaluateExpTile (TileDTD tile1 int1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+      !n = evaluateExpInt (int1, env1)
+  in strictResult (duplicateTileDown t1 n) env1
+
+evaluateExpTile (TileRT90 tile1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+  in strictResult (rotateTile90 t1) env1
+
+evaluateExpTile (TileRT180 tile1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+  in strictResult (rotateTile180 t1) env1
+
+evaluateExpTile (TileRT270 tile1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+  in strictResult (rotateTile270 t1) env1
+
+evaluateExpTile (TileSRT tile1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+  in strictResult (squareRotateTile t1) env1
+
+evaluateExpTile (TileST tile1 int1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+      !n = evaluateExpInt (int1, env1)
+  in strictResult (scaleTile t1 n) env1
+
+evaluateExpTile (TileCBT tile1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+  in strictResult (createBlankTile t1) env1
+
+evaluateExpTile (TileRTX tile1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+  in strictResult (reflectTileX t1) env1
+
+evaluateExpTile (TileRTY tile1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+  in strictResult (reflectTileY t1) env1
+
+evaluateExpTile (TileRTXY tile1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+  in strictResult (reflectTileXY t1) env1
+
+evaluateExpTile (TileSub tile1 i1 i2 i3 i4, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+      !a = evaluateExpInt (i1, env1)
+      !b = evaluateExpInt (i2, env1)
+      !c = evaluateExpInt (i3, env1)
+      !d = evaluateExpInt (i4, env1)
+  in strictResult (createSubTile t1 a b c d) env1
+
+evaluateExpTile (TileConjunct tile1 tile2, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+      !(t2, env2) = evaluateExpTile (tile2, env1)
+  in strictResult (conjunctTiles t1 t2) env2
+
+evaluateExpTile (TileNegate tile1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+  in strictResult (negateTile t1) env1
+
+evaluateExpTile (TileRemoveTop tile1 int1, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+      !n = evaluateExpInt (int1, env1)
+  in strictResult (removeTop t1 n) env1
+
+-- ---------------------------------------------------------------------------
+-- Integer expression evaluation
+-- ---------------------------------------------------------------------------
+
 evaluateExpInt :: (ExpInt, Environment) -> Int
-evaluateExpInt ((IntVal int1), env) = int1
-evaluateExpInt ((IntVar name), env) = getIntVar name env
-evaluateExpInt ((IntNegate int1), env) = -evaluateExpInt (int1, env)
-evaluateExpInt ((IntPlus int1 int2), env) = (newInt1) + (newInt2)
-  where
-    newInt1 = evaluateExpInt (int1, env)
-    newInt2 = evaluateExpInt (int2, env)
-evaluateExpInt ((IntMinus int1 int2), env) = (newInt1) - (newInt2)
-  where
-    newInt1 = evaluateExpInt (int1, env)
-    newInt2 = evaluateExpInt (int2, env)
-evaluateExpInt ((IntTimes int1 int2), env) = (newInt1) * (newInt2)
-  where
-    newInt1 = evaluateExpInt (int1, env)
-    newInt2 = evaluateExpInt (int2, env)
-evaluateExpInt ((IntDivide int1 int2), env) = (newInt1) `div` (newInt2)
-  where
-    newInt1 = evaluateExpInt (int1, env)
-    newInt2 = evaluateExpInt (int2, env)
-evaluateExpInt ((IntExponential int1 int2), env) = (newInt1) ^ (newInt2)
-  where
-    newInt1 = evaluateExpInt (int1, env)
-    newInt2 = evaluateExpInt (int2, env)
+evaluateExpInt (IntVal n, _)         = n
+evaluateExpInt (IntVar name, env)    = getIntVar name env
+evaluateExpInt (IntNegate i1, env)   = negate $! evaluateExpInt (i1, env)
+evaluateExpInt (IntPlus i1 i2, env)  = evaluateExpInt (i1, env) + evaluateExpInt (i2, env)
+evaluateExpInt (IntMinus i1 i2, env) = evaluateExpInt (i1, env) - evaluateExpInt (i2, env)
+evaluateExpInt (IntTimes i1 i2, env) = evaluateExpInt (i1, env) * evaluateExpInt (i2, env)
+evaluateExpInt (IntDivide i1 i2, env)= evaluateExpInt (i1, env) `div` evaluateExpInt (i2, env)
+evaluateExpInt (IntExponential i1 i2, env) =
+  evaluateExpInt (i1, env) ^ evaluateExpInt (i2, env)
 
--- Evaluates a boolean expressions to a boolean
+-- ---------------------------------------------------------------------------
+-- Boolean expression evaluation
+-- ---------------------------------------------------------------------------
+
 evaluateExpBool :: (ExpBool, Environment) -> Bool
-evaluateExpBool (BoolTrue, env) = True
-evaluateExpBool (BoolFalse, env) = False
-evaluateExpBool ((BoolAnd bool1 bool2), env) = (newBool1) && (newBool2)
-  where
-    newBool1 = evaluateExpBool (bool1, env)
-    newBool2 = evaluateExpBool (bool2, env)
-evaluateExpBool ((BoolOr bool1 bool2), env) = (newBool1) && (newBool2)
-  where
-    newBool1 = evaluateExpBool (bool1, env)
-    newBool2 = evaluateExpBool (bool2, env)
-evaluateExpBool ((BoolNot bool1), env) = not (newBool1)
-  where
-    newBool1 = evaluateExpBool (bool1, env)
-evaluateExpBool ((BoolLessThan exp1 exp2), env) = (newInt1) < (newInt2)
-  where
-    newInt1 = evaluateExpInt (exp1, env)
-    newInt2 = evaluateExpInt (exp2, env)
-evaluateExpBool ((BoolLessEqualThan exp1 exp2), env) = (newInt1) <= (newInt2)
-  where
-    newInt1 = evaluateExpInt (exp1, env)
-    newInt2 = evaluateExpInt (exp2, env)
-evaluateExpBool ((BoolMoreThan exp1 exp2), env) = (newInt1) > (newInt2)
-  where
-    newInt1 = evaluateExpInt (exp1, env)
-    newInt2 = evaluateExpInt (exp2, env)
-evaluateExpBool ((BoolMoreEqualThan exp1 exp2), env) = (newInt1) >= (newInt2)
-  where
-    newInt1 = evaluateExpInt (exp1, env)
-    newInt2 = evaluateExpInt (exp2, env)
-evaluateExpBool ((BoolEqual exp1 exp2), env) = (newInt1) == (newInt2)
-  where
-    newInt1 = evaluateExpInt (exp1, env)
-    newInt2 = evaluateExpInt (exp2, env)
-evaluateExpBool ((BoolNotEqual exp1 exp2), env) = (newInt1) /= (newInt2)
-  where
-    newInt1 = evaluateExpInt (exp1, env)
-    newInt2 = evaluateExpInt (exp2, env)
+evaluateExpBool (BoolTrue, _)  = True
+evaluateExpBool (BoolFalse, _) = False
+evaluateExpBool (BoolAnd b1 b2, env) =
+  evaluateExpBool (b1, env) && evaluateExpBool (b2, env)
+evaluateExpBool (BoolOr b1 b2, env) =
+  evaluateExpBool (b1, env) || evaluateExpBool (b2, env)
+evaluateExpBool (BoolNot b1, env) =
+  not (evaluateExpBool (b1, env))
+evaluateExpBool (BoolLessThan e1 e2, env) =
+  evaluateExpInt (e1, env) < evaluateExpInt (e2, env)
+evaluateExpBool (BoolLessEqualThan e1 e2, env) =
+  evaluateExpInt (e1, env) <= evaluateExpInt (e2, env)
+evaluateExpBool (BoolMoreThan e1 e2, env) =
+  evaluateExpInt (e1, env) > evaluateExpInt (e2, env)
+evaluateExpBool (BoolMoreEqualThan e1 e2, env) =
+  evaluateExpInt (e1, env) >= evaluateExpInt (e2, env)
+evaluateExpBool (BoolEqual e1 e2, env) =
+  evaluateExpInt (e1, env) == evaluateExpInt (e2, env)
+evaluateExpBool (BoolNotEqual e1 e2, env) =
+  evaluateExpInt (e1, env) /= evaluateExpInt (e2, env)
 
--- Converts from Bool to ExpBool
-convBoolToExpBool :: Bool -> ExpBool
-convBoolToExpBool True = BoolTrue
-convBoolToExpBool False = BoolFalse
+-- ---------------------------------------------------------------------------
+-- Tile operations (optimised)
+-- ---------------------------------------------------------------------------
 
--- Converts from Int to ExpInt
-convIntToExpInt :: Int -> ExpInt
-convIntToExpInt val = IntVal val
-
--- Used to Combine two Tiles to the right
+-- Combine side-by-side: use zipWith and cons, not [x++y] ++ rest
 combineTilesRight :: TileVar -> TileVar -> TileVar
-combineTilesRight (Tile xs) (Tile ys) = Tile (combineLineArrays xs ys)
+combineTilesRight (Tile xs) (Tile ys) = Tile (zipWith (++) xs ys)
 
-combineLineArrays :: [String] -> [String] -> [String]
-combineLineArrays [] [] = []
-combineLineArrays _ [] = error "Not same tile size"
-combineLineArrays [] _ = error "Not same tile size"
-combineLineArrays (x : xs) (y : ys) = [x ++ y] ++ combineLineArrays xs ys
-
--- Used to duplicate a tile right for specified amount
-duplicateTileRight :: TileVar -> Int -> TileVar
-duplicateTileRight (tile) amount
-  | amount == 1 = tile
-  | otherwise = (combineTilesRight (tile) (duplicateTileRight tile (amount - 1)))
-
--- Used to duplicate a tile down for a specified amount
-duplicateTileDown :: TileVar -> Int -> TileVar
-duplicateTileDown (tile) amount
-  | amount == 1 = tile
-  | otherwise = (combineTilesDown (tile) (duplicateTileDown tile (amount - 1)))
-
--- Used to combine two tiles above/below each other
+-- Combine vertically: just list append (already fine)
 combineTilesDown :: TileVar -> TileVar -> TileVar
 combineTilesDown (Tile xs) (Tile ys) = Tile (xs ++ ys)
 
--- Used to rotate a tile
-rotateTile90Degrees (Tile xs) = Tile (rotateHelper (xs))
+-- Duplicate right: use foldr1 instead of linear recursion
+duplicateTileRight :: TileVar -> Int -> TileVar
+duplicateTileRight t@(Tile rows) n
+  | n <= 1    = t
+  | otherwise = Tile (map (concat . replicate n) rows)
 
-rotateTile180Degrees (tile) = rotateTile90Degrees $ rotateTile90Degrees tile
+-- Duplicate down: replicate the rows directly
+duplicateTileDown :: TileVar -> Int -> TileVar
+duplicateTileDown t@(Tile rows) n
+  | n <= 1    = t
+  | otherwise = Tile (concat (replicate n rows))
 
-rotateTile270Degrees (tile) = rotateTile90Degrees $ rotateTile90Degrees $ rotateTile90Degrees tile
+-- Rotate 90°: transpose then reverse each row
+--   Old code: hand-rolled rotateHelper with !!, map tail — O(n*m) but huge constant
+--   New code: transpose is in Data.List, well-optimised
+rotateTile90 :: TileVar -> TileVar
+rotateTile90 (Tile xs) = Tile (map reverse (transpose xs))
 
-rotateHelper :: [String] -> [String]
-rotateHelper (xs)
-  | length (xs !! 0) > 1 = getFirst xs : rotateHelper (map tail xs)
-  | otherwise = [getFirst xs]
+-- Rotate 180°: reverse rows, then reverse each row
+--   Old code: called rotateTile90 twice
+rotateTile180 :: TileVar -> TileVar
+rotateTile180 (Tile xs) = Tile (reverse (map reverse xs))
 
-getFirst :: [String] -> String
-getFirst [] = []
-getFirst (x : xs) = getFirst xs ++ [head x]
+-- Rotate 270°: reverse each row, then transpose
+--   Old code: called rotateTile90 three times!
+rotateTile270 :: TileVar -> TileVar
+rotateTile270 (Tile xs) = Tile (transpose (map reverse xs))
 
--- Combines all 4 rotated tiles into one big tile
-squareRotateTile (x) = combineTilesDown (combineTilesRight x (rotateTile90Degrees x)) (combineTilesRight (rotateTile270Degrees x) (rotateTile180Degrees x))
+-- Square rotate: combine all 4 rotations
+squareRotateTile :: TileVar -> TileVar
+squareRotateTile x =
+  let !r90  = rotateTile90 x
+      !r180 = rotateTile180 x
+      !r270 = rotateTile270 x
+      !top  = combineTilesRight x r90
+      !bot  = combineTilesRight r270 r180
+  in combineTilesDown top bot
 
--- Used to Scale a Tile
+-- Scale: replicate each char n times, replicate each row n times
+--   Old code: built tile cell-by-cell with combineTilesRight — extremely slow
 scaleTile :: TileVar -> Int -> TileVar
-scaleTile (Tile xs) amount = (scaleTileRow xs amount)
+scaleTile (Tile xs) n =
+  Tile (concatMap (\row -> replicate n (concatMap (replicate n) row)) xs)
 
-scaleTileRow :: [String] -> Int -> TileVar
-scaleTileRow [x] amount = (scaleTileLine (x) amount)
-scaleTileRow (x : xs) amount = combineTilesDown (scaleTileLine (x) amount) (scaleTileRow xs amount)
-
-scaleTileLine :: String -> Int -> TileVar
-scaleTileLine [x] amount = Tile (scaleTileSingular x amount)
-scaleTileLine (x : xs) amount = combineTilesRight (Tile (scaleTileSingular x amount)) (scaleTileLine xs amount)
-
-scaleTileSingular :: Char -> Int -> [String]
-scaleTileSingular x amount = replicate amount $ (concat $ replicate amount [x])
-
--- Used to create a blank tile replica of the same size of the input tile
+-- Blank tile: same dimensions, all '0'
 createBlankTile :: TileVar -> TileVar
-createBlankTile (Tile [x]) = Tile [(concat $ replicate (length x) "0")]
-createBlankTile (Tile (x : xs)) = Tile (replicate (length (x : xs)) $ (concat $ replicate (length x) "0"))
+createBlankTile (Tile [])    = Tile []
+createBlankTile (Tile (x:xs)) =
+  let w = length x
+      h = length (x:xs)
+  in Tile (replicate h (replicate w '0'))
 
--- Used to reflect a tile by x axis
+-- Reflections
 reflectTileX :: TileVar -> TileVar
 reflectTileX (Tile x) = Tile (reverse x)
 
--- Used to reflect a tile by y axis
 reflectTileY :: TileVar -> TileVar
 reflectTileY (Tile x) = Tile (map reverse x)
 
--- Used to reflect a tile by y=x
 reflectTileXY :: TileVar -> TileVar
-reflectTileXY (tile) = reflectTileY $ reflectTileX tile
+reflectTileXY t = reflectTileY (reflectTileX t)
 
--- Used to conjunct two tiles
+-- Conjunct (AND) two tiles
 conjunctTiles :: TileVar -> TileVar -> TileVar
-conjunctTiles (Tile x) (Tile y) = Tile (map zipTiles (zip x y))
+conjunctTiles (Tile x) (Tile y) =
+  Tile (zipWith (zipWith andChar) x y)
   where
-    zipTiles (x, y) = zipWith (\x y -> if all (== '1') [x, y] then '1' else '0') x y
+    andChar '1' '1' = '1'
+    andChar _   _   = '0'
 
--- Used to negate a tile
+-- Negate (invert) a tile
 negateTile :: TileVar -> TileVar
-negateTile (Tile x) = Tile (map negateRow x)
+negateTile (Tile x) = Tile (map (map negChar) x)
   where
-    negateRow = map (\x -> if x == '0' then '1' else '0')
+    negChar '0' = '1'
+    negChar _   = '0'
 
--- Used to create sub tiles from starting positions and lengths
+-- Sub-tile extraction
 createSubTile :: TileVar -> Int -> Int -> Int -> Int -> TileVar
-createSubTile (Tile xs) (xPos) (yPos) xsize ysize = Tile (splitList yPos ysize $ map (splitList xPos xsize) xs)
+createSubTile (Tile xs) xPos yPos xsize ysize =
+  Tile (take ysize . drop yPos $ map (take xsize . drop xPos) xs)
 
-splitList :: Int -> Int -> [a] -> [a]
-splitList startPos length xs = take (length) (drop (startPos) xs)
-
--- Used to remove a top row of tiles
+-- Remove top rows
 removeTop :: TileVar -> Int -> TileVar
-removeTop (Tile xs) val = Tile (drop val xs)
+removeTop (Tile xs) n = Tile (drop n xs)
 
-variableNameExists :: String -> [(String, a)] -> Bool
-variableNameExists name [] = False
-variableNameExists name ((var, tile) : xs)
-  | name == var = True
-  | otherwise = variableNameExists name xs
-
--- Remove IO from prettyPrint
+-- Pretty print
 prettyPrint :: TileVar -> String
 prettyPrint (Tile xs) = intercalate "\n" xs
