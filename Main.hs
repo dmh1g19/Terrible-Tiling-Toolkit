@@ -14,26 +14,39 @@ import qualified TileView
 import Examples
 import Data.List (find)
 import Data.Monoid (mconcat)
+import Data.Aeson (withObject, (.:))
 
 -- | Split a MisoString on newline characters.
 splitNewlines :: MisoString -> [MisoString]
 splitNewlines s = map ms (lines (JS.unpack s))
 
 examples :: [Example]
-examples = [example1, example2, example3, example4, example5, example6, example7, example8, example9, example10]
+examples = [example1, example2, example3, example4, example5,
+            example6, example7, example8, example9, example10]
 
--- | Our model includes the DSL code, evaluation output, tile inputs,
---   and temporary inputs for a new tile.
+-- ---------------------------------------------------------------------------
+-- Model
+-- ---------------------------------------------------------------------------
+
 data Model = Model
   { dslInput     :: MisoString
   , output       :: [MisoString]
   , tileInputs   :: [(MisoString, MisoString)]
   , newTileName  :: MisoString
   , newTileShape :: MisoString
+  -- Viewport state
+  , vpZoom       :: Float
+  , vpPanX       :: Float
+  , vpPanY       :: Float
+  , isDragging   :: Bool
+  , lastMouseX   :: Float
+  , lastMouseY   :: Float
   } deriving (Show, Eq)
 
--- | Actions include updating inputs, adding/removing tiles, evaluating DSL,
---   processing results, and selecting a pre-loaded example.
+-- ---------------------------------------------------------------------------
+-- Action
+-- ---------------------------------------------------------------------------
+
 data Action
   = DSLInputChanged MisoString
   | EvaluateDSL
@@ -44,7 +57,54 @@ data Action
   | RemoveTile Int
   | SelectExample MisoString
   | NoOp
+  -- Viewport
+  | StartDrag Float Float
+  | DragMove  Float Float
+  | StopDrag
+  | WheelZoom Float
+  | ResetViewport
   deriving (Show, Eq)
+
+-- ---------------------------------------------------------------------------
+-- Event decoders
+-- ---------------------------------------------------------------------------
+
+mousePositionDecoder :: Decoder (Float, Float)
+mousePositionDecoder = Decoder
+  { decodeAt = DecodeTarget mempty
+  , decoder  = withObject "MouseEvent" $ \o -> do
+      x <- o .: "clientX"
+      y <- o .: "clientY"
+      return (x, y)
+  }
+
+wheelDeltaDecoder :: Decoder Float
+wheelDeltaDecoder = Decoder
+  { decodeAt = DecodeTarget mempty
+  , decoder  = withObject "WheelEvent" $ \o -> o .: "deltaY"
+  }
+
+-- ---------------------------------------------------------------------------
+-- Zoom / pan constants
+-- ---------------------------------------------------------------------------
+
+zoomMin, zoomMax, zoomFactor :: Float
+zoomMin    = 0.1
+zoomMax    = 30.0
+zoomFactor = 1.1
+
+clampZoom :: Float -> Float
+clampZoom z = max zoomMin (min zoomMax z)
+
+-- Heuristic: assume the SVG container is ~600 px wide at zoom 1.
+panScale :: Float -> (Float, Float) -> (Float, Float)
+panScale zoom (cw, ch) =
+  let base = max cw ch / 600.0
+  in (base / zoom, base / zoom)
+
+-- ---------------------------------------------------------------------------
+-- Entry point
+-- ---------------------------------------------------------------------------
 
 main :: IO ()
 main = startApp App
@@ -55,119 +115,217 @@ main = startApp App
       , tileInputs   = []
       , newTileName  = ""
       , newTileShape = ""
+      , vpZoom       = 1.0
+      , vpPanX       = 0.0
+      , vpPanY       = 0.0
+      , isDragging   = False
+      , lastMouseX   = 0
+      , lastMouseY   = 0
       }
-  , update = updateModel
-  , view = viewModel
-  , events = defaultEvents
-  , subs = []
+  , update    = updateModel
+  , view      = viewModel
+  , events    = defaultEvents
+  , subs      = []
   , mountPoint = Nothing
   }
 
+-- ---------------------------------------------------------------------------
+-- Update
+-- ---------------------------------------------------------------------------
+
 updateModel :: Action -> Model -> Effect Action Model
-updateModel (DSLInputChanged newInput) model = noEff model { dslInput = newInput }
-updateModel (NewTileNameChanged newName) model = noEff model { newTileName = newName }
-updateModel (NewTileShapeChanged newShape) model = noEff model { newTileShape = newShape }
-updateModel AddTile model@Model { newTileName = name, newTileShape = shape, tileInputs = tiles } =
-  noEff model { tileInputs = tiles ++ [(name, shape)]
-              , newTileName  = ""
-              , newTileShape = ""
-              }
-updateModel (RemoveTile idx) model@Model { tileInputs = tiles } =
-  let newTiles = take idx tiles ++ drop (idx + 1) tiles
-  in noEff model { tileInputs = newTiles }
-updateModel (SelectExample exName) model =
+
+updateModel (DSLInputChanged newInput) m = noEff m { dslInput = newInput }
+updateModel (NewTileNameChanged n) m     = noEff m { newTileName = n }
+updateModel (NewTileShapeChanged s) m    = noEff m { newTileShape = s }
+
+updateModel AddTile m =
+  noEff m { tileInputs = tileInputs m ++ [(newTileName m, newTileShape m)]
+          , newTileName  = ""
+          , newTileShape = ""
+          }
+
+updateModel (RemoveTile idx) m =
+  noEff m { tileInputs = take idx (tileInputs m)
+                       ++ drop (idx + 1) (tileInputs m) }
+
+updateModel (SelectExample exName) m =
   case find (\ex -> exampleName ex == exName) examples of
-    Just ex -> noEff model { dslInput = exampleDSL ex, tileInputs = exampleTiles ex }
-    Nothing -> noEff model
-updateModel EvaluateDSL model@Model { dslInput = dsl, tileInputs = tiles } = model <# do
-  let code = JS.unpack dsl
-      tileData = map (\(n, s) -> (JS.unpack n, JS.unpack s)) tiles
-  result <- try (evaluate (force (runTslInBrowser code tileData))) :: IO (Either SomeException [String])
+    Just ex -> noEff m { dslInput   = exampleDSL ex
+                       , tileInputs = exampleTiles ex
+                       , vpZoom = 1.0, vpPanX = 0.0, vpPanY = 0.0
+                       }
+    Nothing -> noEff m
+
+updateModel EvaluateDSL m = m <# do
+  let code     = JS.unpack (dslInput m)
+      tileData = map (\(n, s) -> (JS.unpack n, JS.unpack s)) (tileInputs m)
+  result <- try (evaluate (force (runTslInBrowser code tileData)))
+              :: IO (Either SomeException [String])
   case result of
-    Left err   -> pure $ DSLResult (Left (ms (show err)))
+    Left err   -> pure $ DSLResult (Left  (ms (show err)))
     Right outs -> pure $ DSLResult (Right (map ms outs))
-updateModel (DSLResult res) model =
+
+updateModel (DSLResult res) m =
   case res of
-    Left errMsg -> noEff model { output = [ "Error: " <> errMsg ] }
-    Right outs  -> noEff model { output = outs }
-updateModel NoOp model = noEff model
+    Left errMsg -> noEff m { output = ["Error: " <> errMsg] }
+    Right outs  -> noEff m { output = outs
+                           , vpZoom = 1.0, vpPanX = 0.0, vpPanY = 0.0
+                           }
+
+updateModel NoOp m = noEff m
+
+-- Viewport: start drag ---------------------------------------------------
+updateModel (StartDrag mx my) m =
+  noEff m { isDragging = True, lastMouseX = mx, lastMouseY = my }
+
+-- Viewport: drag (pan) ---------------------------------------------------
+updateModel (DragMove mx my) m
+  | not (isDragging m) = noEff m
+  | otherwise =
+    let tileData = concatMap splitNewlines (output m)
+        cSize    = TileView.tileContentSize tileData
+        (sx, sy) = panScale (vpZoom m) cSize
+        dx       = (mx - lastMouseX m) * sx
+        dy       = (my - lastMouseY m) * sy
+    in noEff m { vpPanX = vpPanX m - dx
+               , vpPanY = vpPanY m - dy
+               , lastMouseX = mx
+               , lastMouseY = my
+               }
+
+-- Viewport: stop drag -----------------------------------------------------
+updateModel StopDrag m = noEff m { isDragging = False }
+
+-- Viewport: wheel zoom (keeps view centre stable) -------------------------
+updateModel (WheelZoom deltaY) m =
+  let tileData = concatMap splitNewlines (output m)
+      (cw, ch) = TileView.tileContentSize tileData
+      oldZ     = vpZoom m
+      newZ     = clampZoom $ if deltaY < 0
+                               then oldZ * zoomFactor
+                               else oldZ / zoomFactor
+      oldVBW   = cw / oldZ;  oldVBH = ch / oldZ
+      newVBW   = cw / newZ;  newVBH = ch / newZ
+      cx       = vpPanX m + oldVBW / 2
+      cy       = vpPanY m + oldVBH / 2
+  in noEff m { vpZoom = newZ
+             , vpPanX = cx - newVBW / 2
+             , vpPanY = cy - newVBH / 2
+             }
+
+-- Viewport: reset ---------------------------------------------------------
+updateModel ResetViewport m =
+  noEff m { vpZoom = 1.0, vpPanX = 0.0, vpPanY = 0.0 }
+
+-- ---------------------------------------------------------------------------
+-- View
+-- ---------------------------------------------------------------------------
 
 viewModel :: Model -> View Action
 viewModel Model {..} = div_ [ style_ containerStyle ]
   [ div_ [ style_ leftColumnStyle ]
       [ h1_ [ style_ headerStyle ] [ text "Examples" ]
-      , select_ [ onChange (\val -> SelectExample val), style_ dropdownStyle ]
+      , select_ [ onChange SelectExample, style_ dropdownStyle ]
           (defaultOption : map optionView examples)
       , h1_ [ style_ headerStyle ] [ text "DSL Editor" ]
       , textarea_
           [ onInput DSLInputChanged
           , style_ (mconcat [ "width" =: "100%"
-                           , "height" =: "200px"
-                           , "margin-bottom" =: "10px"
-                           , "padding" =: "10px"
-                           , "font-size" =: "14px"
-                           ])
-          ]
-          [ text dslInput ]
-      , button_ [ onClick EvaluateDSL, style_ buttonStyle ] [ text "Evaluate DSL" ]
+                            , "height" =: "200px"
+                            , "margin-bottom" =: "10px"
+                            , "padding" =: "10px"
+                            , "font-size" =: "14px"
+                            ])
+          ] [ text dslInput ]
+      , button_ [ onClick EvaluateDSL, style_ buttonStyle ]
+          [ text "Evaluate DSL" ]
       , h2_ [ style_ headerStyle ] [ text "Tile Inputs:" ]
       , div_ [] (map (uncurry viewTile) (zip [0..] tileInputs))
       , h2_ [ style_ headerStyle ] [ text "Add New Tile:" ]
       , div_ [ style_ (mconcat [ "margin-bottom" =: "20px" ]) ]
-          [ input_ [ placeholder_ "Tile Name", value_ newTileName, onInput NewTileNameChanged, style_ inputStyle ]
-          , input_ [ placeholder_ "Tile Shape", value_ newTileShape, onInput NewTileShapeChanged, style_ inputStyle ]
-          , button_ [ onClick AddTile, style_ buttonStyle ] [ text "Add Tile" ]
+          [ input_ [ placeholder_ "Tile Name"
+                   , value_ newTileName
+                   , onInput NewTileNameChanged
+                   , style_ inputStyle ]
+          , input_ [ placeholder_ "Tile Shape"
+                   , value_ newTileShape
+                   , onInput NewTileShapeChanged
+                   , style_ inputStyle ]
+          , button_ [ onClick AddTile, style_ buttonStyle ]
+              [ text "Add Tile" ]
           ]
       ]
   , div_ [ style_ rightColumnStyle ]
-      [ h1_ [ style_ headerStyle ] [ text "Tile Output:" ]
+      [ -- toolbar: title + zoom controls
+        div_ [ style_ (mconcat [ "display" =: "flex"
+                                , "justify-content" =: "space-between"
+                                , "align-items" =: "center"
+                                , "margin-bottom" =: "8px"
+                                ]) ]
+          [ h1_ [ style_ headerStyle ] [ text "Tile Output:" ]
+          , div_ [ style_ (mconcat [ "display" =: "flex"
+                                   , "gap" =: "6px"
+                                   , "align-items" =: "center" ]) ]
+              [ span_ [ style_ (mconcat [ "font-size" =: "13px"
+                                        , "color" =: "#888" ]) ]
+                  [ text (ms (show (round (vpZoom * 100) :: Int) ++ "%")) ]
+              , button_ [ onClick (WheelZoom (-1)), style_ smallBtnStyle ]
+                  [ text "+" ]
+              , button_ [ onClick (WheelZoom 1), style_ smallBtnStyle ]
+                  [ text "\x2212" ]
+              , button_ [ onClick ResetViewport, style_ smallBtnStyle ]
+                  [ text "Reset" ]
+              ]
+          ]
       , if not (null output) && ("Error:" `JS.isPrefixOf` head output)
-           then div_ [ style_ errorStyle ] [ text (head output) ]
-           else TileView.viewTileSVG (concatMap splitNewlines output)
+          then div_ [ style_ errorStyle ] [ text (head output) ]
+          else viewportContainer output vpCfg isDragging
       ]
   ]
   where
+    vpCfg = TileView.ViewportConfig vpZoom vpPanX vpPanY
+
     containerStyle = mconcat
-      [ "display" =: "flex"
-      , "flex-direction" =: "row"
-      , "font-family" =: "Arial, sans-serif"
-      ]
+      [ "display" =: "flex", "flex-direction" =: "row"
+      , "font-family" =: "Arial, sans-serif", "height" =: "100vh" ]
     leftColumnStyle = mconcat
-      [ "width" =: "50%"
-      , "padding" =: "20px"
+      [ "width" =: "50%", "padding" =: "20px"
       , "background-color" =: "#f7f7f7"
       , "box-shadow" =: "2px 0px 5px rgba(0,0,0,0.1)"
-      ]
+      , "overflow-y" =: "auto" ]
     rightColumnStyle = mconcat
-      [ "width" =: "50%"
-      , "padding" =: "20px"
-      ]
-    headerStyle = mconcat [ "color" =: "#333", "margin-bottom" =: "10px" ]
-    inputStyle = mconcat
-      [ "padding" =: "8px"
-      , "margin-right" =: "10px"
-      , "border" =: "1px solid #ccc"
-      , "border-radius" =: "4px"
-      ]
-    buttonStyle = mconcat
-      [ "padding" =: "10px 15px"
-      , "background-color" =: "#3498db"
-      , "color" =: "white"
-      , "border" =: "none"
-      , "border-radius" =: "4px"
-      , "cursor" =: "pointer"
-      , "margin-right" =: "10px"
-      ]
-    dropdownStyle = mconcat
-      [ "width" =: "100%"
-      , "padding" =: "8px"
-      , "margin-bottom" =: "20px"
-      , "border" =: "1px solid #ccc"
-      , "border-radius" =: "4px"
-      ]
+      [ "width" =: "50%", "padding" =: "20px"
+      , "display" =: "flex", "flex-direction" =: "column" ]
+    headerStyle  = mconcat [ "color" =: "#333", "margin-bottom" =: "10px" ]
+    inputStyle   = mconcat [ "padding" =: "8px", "margin-right" =: "10px"
+                           , "border" =: "1px solid #ccc"
+                           , "border-radius" =: "4px" ]
+    buttonStyle  = mconcat [ "padding" =: "10px 15px"
+                           , "background-color" =: "#3498db"
+                           , "color" =: "white", "border" =: "none"
+                           , "border-radius" =: "4px"
+                           , "cursor" =: "pointer"
+                           , "margin-right" =: "10px" ]
+    smallBtnStyle = mconcat [ "padding" =: "4px 10px"
+                            , "background-color" =: "#3498db"
+                            , "color" =: "white", "border" =: "none"
+                            , "border-radius" =: "4px"
+                            , "cursor" =: "pointer"
+                            , "font-size" =: "14px" ]
+    dropdownStyle = mconcat [ "width" =: "100%", "padding" =: "8px"
+                            , "margin-bottom" =: "20px"
+                            , "border" =: "1px solid #ccc"
+                            , "border-radius" =: "4px" ]
+    errorStyle = mconcat [ "color" =: "red", "font-weight" =: "bold"
+                         , "padding" =: "10px" ]
+
     defaultOption = option_ [ value_ "" ] [ text "Select an example" ]
+
     optionView :: Example -> View Action
-    optionView ex = option_ [ value_ (exampleName ex) ] [ text (exampleName ex) ]
+    optionView ex = option_ [ value_ (exampleName ex) ]
+                            [ text (exampleName ex) ]
+
     viewTile :: Int -> (MisoString, MisoString) -> View Action
     viewTile idx (name, shape) =
       div_ [ style_ (mconcat [ "margin-bottom" =: "10px"
@@ -177,9 +335,7 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
                               , "border-radius" =: "4px"
                               , "display" =: "flex"
                               , "justify-content" =: "space-between"
-                              , "align-items" =: "center"
-                              ])
-           ]
+                              , "align-items" =: "center" ]) ]
         [ span_ [ style_ (mconcat [ "margin-right" =: "10px" ]) ]
             [ text ("Name: " <> name <> ", Shape: " <> shape) ]
         , button_ [ onClick (RemoveTile idx)
@@ -188,12 +344,29 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
                                     , "color" =: "white"
                                     , "border" =: "none"
                                     , "border-radius" =: "4px"
-                                    , "cursor" =: "pointer"
-                                    ])
-                  ]
-                  [ text "Remove" ]
+                                    , "cursor" =: "pointer" ]) ]
+            [ text "Remove" ]
         ]
-    errorStyle = mconcat [ "color" =: "red"
-                         , "font-weight" =: "bold"
-                         , "padding" =: "10px"
-                         ]
+
+-- | SVG viewport wrapper with mouse / wheel event handlers.
+viewportContainer :: [MisoString] -> TileView.ViewportConfig -> Bool -> View Action
+viewportContainer outputLines vpCfg dragging =
+  let tileData    = concatMap splitNewlines outputLines
+      cursorVal   = if dragging then "grabbing" else "grab" :: String
+      svgEvents   =
+        [ on "mousedown"  mousePositionDecoder (\(x,y) -> StartDrag x y)
+        , on "mousemove"  mousePositionDecoder (\(x,y) -> DragMove  x y)
+        , on "mouseup"    mousePositionDecoder (\_ -> StopDrag)
+        , on "mouseleave" mousePositionDecoder (\_ -> StopDrag)
+        , onWithOptions (defaultOptions { preventDefault = True })
+            "wheel" wheelDeltaDecoder WheelZoom
+        ]
+  in div_ [ style_ (mconcat [ "flex" =: "1"
+                             , "border" =: "1px solid #ccc"
+                             , "border-radius" =: "6px"
+                             , "overflow" =: "hidden"
+                             , "cursor" =: ms cursorVal
+                             , "user-select" =: "none"
+                             , "min-height" =: "300px"
+                             , "background-color" =: "#fafafa" ]) ]
+       [ TileView.viewTileSVG tileData vpCfg svgEvents ]
