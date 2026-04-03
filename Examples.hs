@@ -135,6 +135,18 @@ example15 :: Example
 example15 = Example
   { exampleName  = "Concentric Diamonds"
   , exampleDesc  = "Iteratively XORs scaled diamond shapes to produce recursive concentric ring patterns."
-  , exampleDSL   = "getTileFile tile1 inp1;\n\n-- Build a diamond from 4 reflections of a triangle\ntopHalf = combineTilesRight(inp1, reflectTileY(inp1));\ndiamond = combineTilesDown(topHalf, reflectTileX(topHalf));\n\n-- Iterate: scale up 2x, tile the smaller version to match,\n-- then XOR them. Each pass adds a new ring.\nresult = diamond;\ni = 0;\nwhile (i < 3) {\n\tbig = scaleTile(result, 2);\n\ttiled = duplicateTileRight(duplicateTileDown(result, 2), 2);\n\tresult = xorTiles(tiled, big);\n\ti = i + 1;\n};\n\nreturn result;"
+  , exampleDSL   = "getTileFile tile1 inp1;\n\n-- Build a diamond from 4 reflections of a triangle\ntopHalf = combineTilesRight(inp1, reflectTileY(inp1));\nresult = combineTilesDown(topHalf, reflectTileX(topHalf));\n\n-- Iterate: scale up 2x, tile the smaller version to match,\n-- then XOR them. Each pass adds a new ring.\ni = 0;\nwhile (i < 3) {\n\tbig = scaleTile(result, 2);\n\ttiled = duplicateTileRight(duplicateTileDown(result, 2), 2);\n\tresult = xorTiles(tiled, big);\n\ti = i + 1;\n};\n\nreturn result;"
   , exampleTiles = [("tile1", "0001 0011 0111 1111")]
+  }
+
+-- | The showcase example: two independent fractal layers grown from
+--   different seeds, woven together via XOR, then reflected into a
+--   kaleidoscopic mandala.  64x64 output using loops, scaling, XOR,
+--   rotation, reflection, and 4-fold symmetry.
+example16 :: Example
+example16 = Example
+  { exampleName  = "Fractal Tapestry"
+  , exampleDesc  = "The showcase: two fractal layers grown from a triangle and a diamond, woven together via XOR, then given a final fractal expansion for a 64x64 mandala of layered detail."
+  , exampleDSL   = "getTileFile tile1 inp1;\ngetTileFile tile2 inp2;\n\n-- Build two 4-fold symmetric motifs directly\nlayer = squareRotateTile(inp1);\naccent = squareRotateTile(inp2);\n\n-- Fractal expansion: 2 iterations (8x8 -> 16 -> 32)\ni = 0;\nwhile (i < 2) {\n\tbig = scaleTile(layer, 2);\n\ttiled = duplicateTileRight(duplicateTileDown(layer, 2), 2);\n\tlayer = xorTiles(big, tiled);\n\n\tbigB = scaleTile(accent, 2);\n\ttiledB = duplicateTileRight(duplicateTileDown(accent, 2), 2);\n\taccent = xorTiles(bigB, rotateTile90Degrees(tiledB));\n\n\ti = i + 1;\n};\n\n-- Weave the two independent fractal layers\ntapestry = xorTiles(layer, accent);\n\n-- One final fractal expansion on the woven result (32 -> 64)\nbig = scaleTile(tapestry, 2);\ntiled = duplicateTileRight(duplicateTileDown(tapestry, 2), 2);\ntapestry = xorTiles(big, tiled);\n\nreturn tapestry;"
+  , exampleTiles = [("tile1", "0001 0011 0111 1111"), ("tile2", "0110 1001 1001 0110")]
   }
