@@ -168,6 +168,11 @@ evaluateExpTile (TileConjunct tile1 tile2, env) =
       !(t2, env2) = evaluateExpTile (tile2, env1)
   in strictResult (conjunctTiles t1 t2) env2
 
+evaluateExpTile (TileXor tile1 tile2, env) =
+  let !(t1, env1) = evaluateExpTile (tile1, env)
+      !(t2, env2) = evaluateExpTile (tile2, env1)
+  in strictResult (xorTiles t1 t2) env2
+
 evaluateExpTile (TileNegate tile1, env) =
   let !(t1, env1) = evaluateExpTile (tile1, env)
   in strictResult (negateTile t1) env1
@@ -299,6 +304,15 @@ conjunctTiles (Tile x) (Tile y) =
   where
     andChar '1' '1' = '1'
     andChar _   _   = '0'
+
+-- XOR two tiles
+xorTiles :: TileVar -> TileVar -> TileVar
+xorTiles (Tile x) (Tile y) =
+  Tile (zipWith (zipWith xorChar) x y)
+  where
+    xorChar '1' '0' = '1'
+    xorChar '0' '1' = '1'
+    xorChar _   _   = '0'
 
 -- Negate (invert) a tile
 negateTile :: TileVar -> TileVar

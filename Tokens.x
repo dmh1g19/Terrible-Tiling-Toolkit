@@ -69,6 +69,7 @@ tokens :-
   createSubTile { (\p s -> TokenSubTile p) }
   negateTile { (\p s -> TokenNegate p) }
   conjunctTiles { (\p s -> TokenConjunct p) }
+  xorTiles { (\p s -> TokenXor p) }
   removeTop { (\p s -> TokenRemoveTop p) }
   return { (\p s -> TokenReturnTile p) }
 
@@ -132,6 +133,7 @@ data Token =
   TokenTileFile AlexPosn         |
   TokenSubTile AlexPosn          |
   TokenConjunct AlexPosn         |
+  TokenXor AlexPosn              |
   TokenNegate AlexPosn           |
   TokenRemoveTop AlexPosn        |
   TokenReturnTile AlexPosn       |
@@ -196,6 +198,9 @@ tokenPosn (TokenTileFile (AlexPn a l c)) = show(l) ++ ":" ++ show(c)
 tokenPosn (TokenSubTile (AlexPn a l c)) = show(l) ++ ":" ++ show(c)
 tokenPosn (TokenRemoveTop (AlexPn a l c)) = show(l) ++ ":" ++ show(c)
 tokenPosn (TokenReturnTile (AlexPn a l c)) = show(l) ++ ":" ++ show(c)
+tokenPosn (TokenConjunct (AlexPn a l c)) = show(l) ++ ":" ++ show(c)
+tokenPosn (TokenXor (AlexPn a l c)) = show(l) ++ ":" ++ show(c)
+tokenPosn (TokenNegate (AlexPn a l c)) = show(l) ++ ":" ++ show(c)
 
 --Variables
 tokenPosn (TokenTileVar (AlexPn a l c) _) = show(l) ++ ":" ++ show(c)

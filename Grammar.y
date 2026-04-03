@@ -59,6 +59,7 @@ import Tokens
     getTileFile { TokenTileFile _ }
     createSubTile { TokenSubTile _ }
     conjunctTiles { TokenConjunct _ }
+    xorTiles { TokenXor _ }
     negateTile { TokenNegate _ }
     removeTop { TokenRemoveTop _ }
     return { TokenReturnTile _ }
@@ -96,6 +97,27 @@ Exp : '(' Exp ')'                                                   { $2 }
     | getTileFile tileVar tileVar                       { ExpGetTileFile $2 $3 }
     | return ExpTile                                    { ExpReturn $2 }
 
+ExpTile : tileVar                                       { TileVar $1 }
+        | combineTilesRight '(' ExpTile ',' ExpTile ')' { TileCTR $3 $5 }
+        | combineTilesDown '(' ExpTile ',' ExpTile ')'  { TileCTD $3 $5 }
+        | duplicateTileRight '(' ExpTile ',' ExpInt ')' { TileDTR $3 $5 }
+        | duplicateTileDown '(' ExpTile ',' ExpInt ')'  { TileDTD $3 $5 }
+        | rotateTile90Degrees '(' ExpTile ')'           { TileRT90 $3 }
+        | rotateTile180Degrees '(' ExpTile ')'          { TileRT180 $3 }
+        | rotateTile270Degrees '(' ExpTile ')'          { TileRT270 $3 }
+        | squareRotateTile '(' ExpTile ')'              { TileSRT $3 }
+        | scaleTile '(' ExpTile ',' ExpInt ')'          { TileST $3 $5 }
+        | createBlankTile '(' ExpTile ')'               { TileCBT $3 }
+        | reflectTileX '(' ExpTile ')'                  { TileRTX $3 }
+        | reflectTileY '(' ExpTile ')'                  { TileRTY $3 }
+        | reflectTileXY '(' ExpTile ')'                 { TileRTXY $3 }
+        | '(' ExpTile ')'                               { $2 } 
+        | createSubTile '(' ExpTile ',' ExpInt ',' ExpInt ',' ExpInt ',' ExpInt ')' { TileSub $3 $5 $7 $9 $11 }
+        | conjunctTiles '(' ExpTile ',' ExpTile ')'      { TileConjunct $3 $5 }
+        | xorTiles '(' ExpTile ',' ExpTile ')'            { TileXor $3 $5 }
+        | negateTile '(' ExpTile ')'                    { TileNegate $3 }
+        | removeTop '(' ExpTile ',' ExpInt ')'          { TileRemoveTop $3 $5 }
+
 ExpInt : int                                            { IntVal $1 }
        | tileVar                                        { IntVar $1 }
        | '-' ExpInt %prec NEG      			            { IntNegate $2 } 
@@ -119,25 +141,6 @@ ExpBool : true                                  { BoolTrue }
         | ExpInt '!' '=' ExpInt                 { BoolNotEqual $1 $4 }
         | '(' ExpBool ')'                       { $2 } 
 
-ExpTile : tileVar                                       { TileVar $1 }
-        | combineTilesRight '(' ExpTile ',' ExpTile ')' { TileCTR $3 $5 }
-        | combineTilesDown '(' ExpTile ',' ExpTile ')'  { TileCTD $3 $5 }
-        | duplicateTileRight '(' ExpTile ',' ExpInt ')' { TileDTR $3 $5 }
-        | duplicateTileDown '(' ExpTile ',' ExpInt ')'  { TileDTD $3 $5 }
-        | rotateTile90Degrees '(' ExpTile ')'           { TileRT90 $3 }
-        | rotateTile180Degrees '(' ExpTile ')'          { TileRT180 $3 }
-        | rotateTile270Degrees '(' ExpTile ')'          { TileRT270 $3 }
-        | squareRotateTile '(' ExpTile ')'              { TileSRT $3 }
-        | scaleTile '(' ExpTile ',' ExpInt ')'          { TileST $3 $5 }
-        | createBlankTile '(' ExpTile ')'               { TileCBT $3 }
-        | reflectTileX '(' ExpTile ')'                  { TileRTX $3 }
-        | reflectTileY '(' ExpTile ')'                  { TileRTY $3 }
-        | reflectTileXY '(' ExpTile ')'                 { TileRTXY $3 }
-        | '(' ExpTile ')'                               { $2 } 
-        | createSubTile '(' ExpTile ',' ExpInt ',' ExpInt ',' ExpInt ',' ExpInt ')' { TileSub $3 $5 $7 $9 $11 }
-        | conjunctTiles '(' ExpTile ',' ExpTile ')'      { TileConjunct $3 $5 }
-        | negateTile '(' ExpTile ')'                    { TileNegate $3 }
-        | removeTop '(' ExpTile ',' ExpInt ')'          { TileRemoveTop $3 $5 }
 { 
 parseError :: [Token] -> a
 parseError [] = error "Unknown Parse Error" 
@@ -193,6 +196,7 @@ data ExpTile = TileVar String
              | TileRTXY ExpTile
              | TileSub ExpTile ExpInt ExpInt ExpInt ExpInt
              | TileConjunct ExpTile ExpTile
+             | TileXor ExpTile ExpTile
              | TileNegate ExpTile
              | TileRemoveTop ExpTile ExpInt
     deriving (Show,Eq)         
