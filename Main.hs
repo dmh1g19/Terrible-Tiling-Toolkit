@@ -15,14 +15,15 @@ import Examples
 import Data.List (find)
 import Data.Monoid (mconcat)
 import Data.Aeson (withObject, (.:))
+import qualified Data.Map.Strict as Map
 
--- | Split a MisoString on newline characters.
 splitNewlines :: MisoString -> [MisoString]
 splitNewlines s = map ms (lines (JS.unpack s))
 
 examples :: [Example]
 examples = [example1, example2, example3, example4, example5,
-            example6, example7, example8, example9, example10]
+            example6, example7, example8, example9, example10,
+            example11, example12, example13, example14, example15]
 
 -- ---------------------------------------------------------------------------
 -- Model
@@ -34,14 +35,14 @@ data Model = Model
   , tileInputs   :: [(MisoString, MisoString)]
   , newTileName  :: MisoString
   , newTileShape :: MisoString
-  -- Viewport (CSS-transform based — values are in screen pixels)
-  , vpZoom       :: Float   -- 1.0 = content fits container
-  , vpPanX       :: Float   -- horizontal shift in px
-  , vpPanY       :: Float   -- vertical shift in px
+  , vpZoom       :: Float
+  , vpPanX       :: Float
+  , vpPanY       :: Float
   , isDragging   :: Bool
   , lastMouseX   :: Float
   , lastMouseY   :: Float
   , isLoading    :: Bool
+  , selectedDesc :: MisoString
   } deriving (Show, Eq)
 
 -- ---------------------------------------------------------------------------
@@ -58,11 +59,10 @@ data Action
   | RemoveTile Int
   | SelectExample MisoString
   | NoOp
-  -- Viewport
   | StartDrag Float Float
   | DragMove  Float Float
   | StopDrag
-  | WheelZoom Float Float Float   -- deltaY, offsetX, offsetY
+  | WheelZoom Float Float Float
   | ResetViewport
   deriving (Show, Eq)
 
@@ -70,6 +70,7 @@ data Action
 -- Event decoders
 -- ---------------------------------------------------------------------------
 
+-- Mouse decoders (desktop)
 mousePositionDecoder :: Decoder (Float, Float)
 mousePositionDecoder = Decoder
   { decodeAt = DecodeTarget mempty
@@ -79,8 +80,6 @@ mousePositionDecoder = Decoder
       return (x, y)
   }
 
--- | Decodes deltaY and the mouse offset within the target element,
---   so we can zoom towards the cursor position.
 wheelDecoder :: Decoder (Float, Float, Float)
 wheelDecoder = Decoder
   { decodeAt = DecodeTarget mempty
@@ -89,6 +88,31 @@ wheelDecoder = Decoder
       ox <- o .: "offsetX"
       oy <- o .: "offsetY"
       return (dy, ox, oy)
+  }
+
+-- Touch decoders (mobile) — navigate into touches[0] / changedTouches[0]
+touchStartDecoder :: Decoder (Float, Float)
+touchStartDecoder = Decoder
+  { decodeAt = DecodeTarget ["touches", "0"]
+  , decoder  = withObject "Touch" $ \o -> do
+      x <- o .: "clientX"
+      y <- o .: "clientY"
+      return (x, y)
+  }
+
+touchMoveDecoder :: Decoder (Float, Float)
+touchMoveDecoder = Decoder
+  { decodeAt = DecodeTarget ["touches", "0"]
+  , decoder  = withObject "Touch" $ \o -> do
+      x <- o .: "clientX"
+      y <- o .: "clientY"
+      return (x, y)
+  }
+
+touchEndDecoder :: Decoder ()
+touchEndDecoder = Decoder
+  { decodeAt = DecodeTarget mempty
+  , decoder  = \_ -> return ()
   }
 
 -- ---------------------------------------------------------------------------
@@ -123,10 +147,16 @@ main = startApp App
       , lastMouseX   = 0
       , lastMouseY   = 0
       , isLoading    = False
+      , selectedDesc = ""
       }
   , update     = updateModel
   , view       = viewModel
-  , events     = defaultEvents
+  , events     = Map.union defaultEvents $ Map.fromList
+                    [ ("touchstart", False)
+                    , ("touchmove",  False)
+                    , ("touchend",   False)
+                    , ("touchcancel", False)
+                    ]
   , subs       = []
   , mountPoint = Nothing
   }
@@ -155,6 +185,7 @@ updateModel (SelectExample exName) m =
   case find (\ex -> exampleName ex == exName) examples of
     Just ex -> noEff m { dslInput   = exampleDSL ex
                        , tileInputs = exampleTiles ex
+                       , selectedDesc = exampleDesc ex
                        , vpZoom = 1.0, vpPanX = 0.0, vpPanY = 0.0
                        }
     Nothing -> noEff m
@@ -177,11 +208,9 @@ updateModel (DSLResult res) m =
 
 updateModel NoOp m = noEff m
 
--- Start drag ---------------------------------------------------------------
 updateModel (StartDrag mx my) m =
   noEff m { isDragging = True, lastMouseX = mx, lastMouseY = my }
 
--- Drag (pan) — direct pixel mapping, no scaling needed --------------------
 updateModel (DragMove mx my) m
   | not (isDragging m) = noEff m
   | otherwise =
@@ -191,26 +220,17 @@ updateModel (DragMove mx my) m
             , lastMouseY = my
             }
 
--- Stop drag ----------------------------------------------------------------
 updateModel StopDrag m = noEff m { isDragging = False }
 
--- Wheel zoom — zoom towards cursor position -------------------------------
---   offsetX/Y is the cursor position within the container.
---   Formula: keep the SVG point under the cursor stationary.
---     screenPt = pan + offset           (not scaled, it's the div-local pos)
---     svgFrac  = (offset - pan) / zoom  (point in "unzoomed" SVG space)
---     After zoom:  newPan = offset - svgFrac * newZoom
 updateModel (WheelZoom deltaY ox oy) m =
   let oldZ  = vpZoom m
       newZ  = clampZoom $ if deltaY < 0
                             then oldZ * zoomFactor
                             else oldZ / zoomFactor
-      -- Keep the point under the cursor fixed
       newPX = ox - (ox - vpPanX m) * (newZ / oldZ)
       newPY = oy - (oy - vpPanY m) * (newZ / oldZ)
   in noEff m { vpZoom = newZ, vpPanX = newPX, vpPanY = newPY }
 
--- Reset --------------------------------------------------------------------
 updateModel ResetViewport m =
   noEff m { vpZoom = 1.0, vpPanX = 0.0, vpPanY = 0.0 }
 
@@ -219,97 +239,165 @@ updateModel ResetViewport m =
 -- ---------------------------------------------------------------------------
 
 viewModel :: Model -> View Action
-viewModel Model {..} = div_ [ style_ containerStyle ]
-  [ div_ [ style_ leftColumnStyle ]
-      [ h1_ [ style_ headerStyle ] [ text "Examples" ]
-      , select_ [ onChange SelectExample, style_ dropdownStyle ]
-          (defaultOption : map optionView examples)
-      , h1_ [ style_ headerStyle ] [ text "DSL Editor" ]
-      , textarea_
-          [ onInput DSLInputChanged
-          , style_ (mconcat [ "width" =: "100%"
-                            , "height" =: "200px"
-                            , "margin-bottom" =: "10px"
-                            , "padding" =: "10px"
-                            , "font-size" =: "14px"
-                            ])
-          ] [ text dslInput ]
-      , button_ [ onClick EvaluateDSL, style_ buttonStyle ]
-          [ text "Evaluate DSL" ]
-      , h2_ [ style_ headerStyle ] [ text "Tile Inputs:" ]
-      , div_ [] (map (uncurry viewTile) (zip [0..] tileInputs))
-      , h2_ [ style_ headerStyle ] [ text "Add New Tile:" ]
-      , div_ [ style_ (mconcat [ "margin-bottom" =: "20px" ]) ]
-          [ input_ [ placeholder_ "Tile Name"
-                   , value_ newTileName
-                   , onInput NewTileNameChanged
-                   , style_ inputStyle ]
-          , input_ [ placeholder_ "Tile Shape"
-                   , value_ newTileShape
-                   , onInput NewTileShapeChanged
-                   , style_ inputStyle ]
-          , button_ [ onClick AddTile, style_ buttonStyle ]
-              [ text "Add Tile" ]
-          ]
-      ]
-  , div_ [ style_ rightColumnStyle ]
-      [ -- Toolbar
-        div_ [ style_ (mconcat [ "display" =: "flex"
-                                , "justify-content" =: "space-between"
-                                , "align-items" =: "center"
-                                , "margin-bottom" =: "8px" ]) ]
-          [ h1_ [ style_ headerStyle ] [ text "Tile Output:" ]
-          , div_ [ style_ (mconcat [ "display" =: "flex"
-                                   , "gap" =: "6px"
-                                   , "align-items" =: "center" ]) ]
-              [ span_ [ style_ (mconcat [ "font-size" =: "13px"
-                                        , "color" =: "#888" ]) ]
-                  [ text (ms (show (round (vpZoom * 100) :: Int) ++ "%")) ]
-              , button_ [ onClick (WheelZoom (-120) 300 200), style_ smallBtnStyle ]
-                  [ text "+" ]
-              , button_ [ onClick (WheelZoom 120 300 200), style_ smallBtnStyle ]
-                  [ text "\x2212" ]
-              , button_ [ onClick ResetViewport, style_ smallBtnStyle ]
-                  [ text "Reset" ]
+viewModel Model {..} = div_ []
+  [ -- Injected CSS: responsive layout + spinner + viewport meta
+    node HTML (ms ("style" :: String)) Nothing []
+      [ text responsiveCSS ]
+  , div_ [ class_ "tttt-container" ]
+      [ div_ [ class_ "tttt-editor" ]
+          [ -- About section
+            h1_ [ style_ (mconcat [ "color" =: "#222"
+                                   , "margin-bottom" =: "4px"
+                                   , "font-size" =: "22px" ]) ]
+              [ text "The Terrible Tiling Toolkit" ]
+          , p_ [ style_ (mconcat [ "color" =: "#666"
+                                  , "font-size" =: "13px"
+                                  , "line-height" =: "1.5"
+                                  , "margin-bottom" =: "16px" ]) ]
+              [ text "An experiment in building interpreters with Haskell. \
+                     \This is a "
+              , em_ [] [ text "domain-specific language" ]
+              , text " (DSL) \x2014 a small, purpose-built programming language \
+                     \designed to do one thing well: describe and transform \
+                     \two-dimensional tile patterns. Unlike general-purpose \
+                     \languages, a DSL trades breadth for expressiveness in its \
+                     \target domain, letting you say in a few lines what would \
+                     \take dozens in Python or JavaScript."
+              ]
+          , p_ [ style_ (mconcat [ "color" =: "#666"
+                                  , "font-size" =: "13px"
+                                  , "line-height" =: "1.5"
+                                  , "margin-bottom" =: "16px" ]) ]
+              [ text "Under the hood the source code is tokenised with "
+              , a_ [ href_ "https://haskell-alex.readthedocs.io/"
+                   , style_ linkStyle ] [ text "Alex" ]
+              , text ", parsed with "
+              , a_ [ href_ "https://haskell-happy.readthedocs.io/"
+                   , style_ linkStyle ] [ text "Happy" ]
+              , text ", and evaluated by a tree-walking interpreter \x2014 the \
+                     \classic pipeline for exploring how programming languages \
+                     \work. The browser front-end is made possible by the "
+              , a_ [ href_ "https://haskell-miso.org/"
+                   , style_ linkStyle ] [ text "Miso" ]
+              , text " framework, which compiles Haskell to JavaScript via \
+                     \GHCJS and provides an Elm-like architecture for building \
+                     \reactive web apps entirely in Haskell. Huge thanks to the \
+                     \Miso team for making this kind of thing feasible!"
+              ]
+          , hr_ [ style_ (mconcat [ "border" =: "none"
+                                   , "border-top" =: "1px solid #ddd"
+                                   , "margin-bottom" =: "16px" ]) ]
+
+          , h2_ [ style_ sectionHeaderStyle ] [ text "Examples" ]
+          , select_ [ onChange SelectExample, style_ dropdownStyle ]
+              (defaultOption : map optionView examples)
+          , if selectedDesc == ""
+              then text ""
+              else p_ [ style_ descStyle ] [ text selectedDesc ]
+          , h2_ [ style_ sectionHeaderStyle ] [ text "DSL Editor" ]
+          , textarea_
+              [ onInput DSLInputChanged
+              , style_ (mconcat [ "width" =: "100%"
+                                , "height" =: "200px"
+                                , "margin-bottom" =: "16px"
+                                , "padding" =: "10px"
+                                , "font-size" =: "16px"
+                                , "box-sizing" =: "border-box"
+                                ])
+              ] [ text dslInput ]
+          , button_ [ onClick EvaluateDSL, style_ buttonStyle ]
+              [ text "Evaluate DSL" ]
+          , h2_ [ style_ sectionHeaderStyle ] [ text "Tile Inputs:" ]
+          , div_ [] (map (uncurry viewTile) (zip [0..] tileInputs))
+          , h2_ [ style_ sectionHeaderStyle ] [ text "Add New Tile:" ]
+          , div_ [ style_ (mconcat [ "margin-bottom" =: "20px"
+                                   , "display" =: "flex"
+                                   , "flex-wrap" =: "wrap"
+                                   , "gap" =: "8px"
+                                   ]) ]
+              [ input_ [ placeholder_ "Tile Name"
+                       , value_ newTileName
+                       , onInput NewTileNameChanged
+                       , style_ inputStyle ]
+              , input_ [ placeholder_ "Tile Shape"
+                       , value_ newTileShape
+                       , onInput NewTileShapeChanged
+                       , style_ inputStyle ]
+              , button_ [ onClick AddTile, style_ buttonStyle ]
+                  [ text "Add Tile" ]
               ]
           ]
-      , if isLoading
-          then loadingIndicator
-          else if not (null output) && ("Error:" `JS.isPrefixOf` head output)
-            then div_ [ style_ errorStyle ] [ text (head output) ]
-            else viewportContainer output vpZoom vpPanX vpPanY isDragging
+      , div_ [ class_ "tttt-output" ]
+          [ -- Toolbar
+            div_ [ style_ (mconcat [ "display" =: "flex"
+                                    , "justify-content" =: "space-between"
+                                    , "align-items" =: "center"
+                                    , "margin-bottom" =: "8px"
+                                    , "flex-wrap" =: "wrap"
+                                    , "gap" =: "8px"
+                                    ]) ]
+              [ h1_ [ style_ headerStyle ] [ text "Tile Output:" ]
+              , div_ [ style_ (mconcat [ "display" =: "flex"
+                                       , "gap" =: "6px"
+                                       , "align-items" =: "center" ]) ]
+                  [ span_ [ style_ (mconcat [ "font-size" =: "13px"
+                                            , "color" =: "#888" ]) ]
+                      [ text (ms (show (round (vpZoom * 100) :: Int) ++ "%")) ]
+                  , button_ [ onClick (WheelZoom (-120) 300 200), style_ smallBtnStyle ]
+                      [ text "+" ]
+                  , button_ [ onClick (WheelZoom 120 300 200), style_ smallBtnStyle ]
+                      [ text "\x2212" ]
+                  , button_ [ onClick ResetViewport, style_ smallBtnStyle ]
+                      [ text "Reset" ]
+                  ]
+              ]
+          , if isLoading
+              then loadingIndicator
+              else if not (null output) && ("Error:" `JS.isPrefixOf` head output)
+                then div_ [ style_ errorStyle ] [ text (head output) ]
+                else viewportContainer output vpZoom vpPanX vpPanY isDragging
+          ]
       ]
   ]
   where
-    containerStyle = mconcat
-      [ "display" =: "flex", "flex-direction" =: "row"
-      , "font-family" =: "Arial, sans-serif", "height" =: "100vh" ]
-    leftColumnStyle = mconcat
-      [ "width" =: "50%", "padding" =: "20px"
-      , "background-color" =: "#f7f7f7"
-      , "box-shadow" =: "2px 0px 5px rgba(0,0,0,0.1)"
-      , "overflow-y" =: "auto" ]
-    rightColumnStyle = mconcat
-      [ "width" =: "50%", "padding" =: "20px"
-      , "display" =: "flex", "flex-direction" =: "column" ]
     headerStyle   = mconcat [ "color" =: "#333", "margin-bottom" =: "10px" ]
-    inputStyle    = mconcat [ "padding" =: "8px", "margin-right" =: "10px"
+    sectionHeaderStyle = mconcat [ "color" =: "#333"
+                                 , "margin-top" =: "20px"
+                                 , "margin-bottom" =: "10px"
+                                 , "font-size" =: "18px" ]
+    descStyle     = mconcat [ "color" =: "#555", "font-size" =: "13px"
+                            , "line-height" =: "1.4"
+                            , "margin-top" =: "4px"
+                            , "margin-bottom" =: "4px"
+                            , "padding" =: "8px 12px"
+                            , "background-color" =: "#eef4fb"
+                            , "border-radius" =: "4px"
+                            , "border-left" =: "3px solid #3498db"
+                            ]
+    linkStyle     = mconcat [ "color" =: "#2980b9", "text-decoration" =: "none" ]
+    inputStyle    = mconcat [ "padding" =: "10px", "font-size" =: "16px"
                             , "border" =: "1px solid #ccc"
-                            , "border-radius" =: "4px" ]
-    buttonStyle   = mconcat [ "padding" =: "10px 15px"
+                            , "border-radius" =: "4px"
+                            , "flex" =: "1", "min-width" =: "100px"
+                            ]
+    buttonStyle   = mconcat [ "padding" =: "12px 18px"
                             , "background-color" =: "#3498db"
                             , "color" =: "white", "border" =: "none"
                             , "border-radius" =: "4px"
                             , "cursor" =: "pointer"
-                            , "margin-right" =: "10px" ]
-    smallBtnStyle = mconcat [ "padding" =: "4px 10px"
+                            , "font-size" =: "16px"
+                            , "touch-action" =: "manipulation"
+                            ]
+    smallBtnStyle = mconcat [ "padding" =: "8px 14px"
                             , "background-color" =: "#3498db"
                             , "color" =: "white", "border" =: "none"
                             , "border-radius" =: "4px"
                             , "cursor" =: "pointer"
-                            , "font-size" =: "14px" ]
-    dropdownStyle = mconcat [ "width" =: "100%", "padding" =: "8px"
-                            , "margin-bottom" =: "20px"
+                            , "font-size" =: "16px"
+                            , "touch-action" =: "manipulation"
+                            ]
+    dropdownStyle = mconcat [ "width" =: "100%", "padding" =: "10px"
+                            , "margin-bottom" =: "20px", "font-size" =: "16px"
                             , "border" =: "1px solid #ccc"
                             , "border-radius" =: "4px" ]
     errorStyle    = mconcat [ "color" =: "red", "font-weight" =: "bold"
@@ -338,8 +426,6 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
         , span_ [ style_ (mconcat [ "color" =: "#666"
                                    , "font-size" =: "14px" ]) ]
             [ text "Evaluating DSL..." ]
-        , node HTML (ms ("style" :: String)) Nothing []
-            [ text "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }" ]
         ]
 
     defaultOption = option_ [ value_ "" ] [ text "Select an example" ]
@@ -351,28 +437,84 @@ viewModel Model {..} = div_ [ style_ containerStyle ]
     viewTile :: Int -> (MisoString, MisoString) -> View Action
     viewTile idx (name, shape) =
       div_ [ style_ (mconcat [ "margin-bottom" =: "10px"
-                              , "padding" =: "5px"
+                              , "padding" =: "8px"
                               , "background-color" =: "#fff"
                               , "border" =: "1px solid #ddd"
                               , "border-radius" =: "4px"
                               , "display" =: "flex"
                               , "justify-content" =: "space-between"
-                              , "align-items" =: "center" ]) ]
-        [ span_ [ style_ (mconcat [ "margin-right" =: "10px" ]) ]
+                              , "align-items" =: "center"
+                              , "flex-wrap" =: "wrap"
+                              , "gap" =: "8px"
+                              ]) ]
+        [ span_ [ style_ (mconcat [ "font-size" =: "14px"
+                                   , "word-break" =: "break-all" ]) ]
             [ text ("Name: " <> name <> ", Shape: " <> shape) ]
         , button_ [ onClick (RemoveTile idx)
-                  , style_ (mconcat [ "padding" =: "5px 10px"
+                  , style_ (mconcat [ "padding" =: "8px 14px"
                                     , "background-color" =: "#e74c3c"
                                     , "color" =: "white", "border" =: "none"
                                     , "border-radius" =: "4px"
-                                    , "cursor" =: "pointer" ]) ]
+                                    , "cursor" =: "pointer"
+                                    , "font-size" =: "14px"
+                                    , "touch-action" =: "manipulation"
+                                    ]) ]
             [ text "Remove" ]
         ]
 
--- | The viewport container.  The SVG content is rendered ONCE inside a
---   wrapper div.  Only the wrapper's CSS `transform` property changes on
---   zoom/pan — the browser GPU-accelerates this without re-laying-out the
---   thousands of SVG <rect> elements.
+-- ---------------------------------------------------------------------------
+-- Responsive CSS injected as a <style> element
+-- ---------------------------------------------------------------------------
+
+responsiveCSS :: MisoString
+responsiveCSS = ms $ unlines
+  [ "* { box-sizing: border-box; margin: 0; }"
+  , "body { margin: 0; padding: 0; overflow-x: hidden; }"
+  , "@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }"
+  , ""
+  , ".tttt-container {"
+  , "  display: flex;"
+  , "  flex-direction: row;"
+  , "  font-family: Arial, sans-serif;"
+  , "  height: 100vh;"
+  , "}"
+  , ".tttt-editor {"
+  , "  width: 50%;"
+  , "  padding: 20px;"
+  , "  background-color: #f7f7f7;"
+  , "  box-shadow: 2px 0px 5px rgba(0,0,0,0.1);"
+  , "  overflow-y: auto;"
+  , "}"
+  , ".tttt-output {"
+  , "  width: 50%;"
+  , "  padding: 20px;"
+  , "  display: flex;"
+  , "  flex-direction: column;"
+  , "}"
+  , ""
+  , "/* Mobile: stack vertically */"
+  , "@media (max-width: 768px) {"
+  , "  .tttt-container {"
+  , "    flex-direction: column !important;"
+  , "    height: auto !important;"
+  , "    min-height: 100vh;"
+  , "  }"
+  , "  .tttt-editor {"
+  , "    width: 100% !important;"
+  , "    max-height: none;"
+  , "    box-shadow: 0 2px 5px rgba(0,0,0,0.1) !important;"
+  , "  }"
+  , "  .tttt-output {"
+  , "    width: 100% !important;"
+  , "    min-height: 60vh;"
+  , "  }"
+  , "}"
+  ]
+
+-- ---------------------------------------------------------------------------
+-- Viewport container with mouse + touch events
+-- ---------------------------------------------------------------------------
+
 viewportContainer :: [MisoString] -> Float -> Float -> Float -> Bool -> View Action
 viewportContainer outputLines zoom panX panY dragging =
   let tileData   = concatMap splitNewlines outputLines
@@ -389,13 +531,22 @@ viewportContainer outputLines zoom panX panY dragging =
                           , "user-select" =: "none"
                           , "min-height" =: "300px"
                           , "background-color" =: "#fafafa"
+                          , "touch-action" =: "none"
                           ])
+       -- Mouse events (desktop)
        , on "mousedown"  mousePositionDecoder (\(x,y) -> StartDrag x y)
        , on "mousemove"  mousePositionDecoder (\(x,y) -> DragMove  x y)
        , on "mouseup"    mousePositionDecoder (\_ -> StopDrag)
        , on "mouseleave" mousePositionDecoder (\_ -> StopDrag)
        , onWithOptions (defaultOptions { preventDefault = True })
            "wheel" wheelDecoder (\(dy,ox,oy) -> WheelZoom dy ox oy)
+       -- Touch events (mobile)
+       , onWithOptions (defaultOptions { preventDefault = True })
+           "touchstart" touchStartDecoder (\(x,y) -> StartDrag x y)
+       , onWithOptions (defaultOptions { preventDefault = True })
+           "touchmove" touchMoveDecoder (\(x,y) -> DragMove x y)
+       , on "touchend"   touchEndDecoder (\_ -> StopDrag)
+       , on "touchcancel" touchEndDecoder (\_ -> StopDrag)
        ]
        [ div_ [ style_ (mconcat [ "width" =: "100%"
                                  , "height" =: "100%"
