@@ -109,3 +109,7 @@ updateModel (WheelZoom deltaY ox oy) m =
 -- Viewport: reset
 updateModel ResetViewport m =
   noEff m { vpZoom = 1.0, vpPanX = 0.0, vpPanY = 0.0 }
+
+-- Paper viewer
+updateModel TogglePaper m =
+  noEff m { showPaper = not (showPaper m) }

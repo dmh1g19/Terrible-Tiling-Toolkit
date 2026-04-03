@@ -27,6 +27,7 @@ data Model = Model
   , lastMouseY   :: Float
   , isLoading    :: Bool
   , selectedDesc :: MisoString
+  , showPaper    :: Bool
   } deriving (Show, Eq)
 
 -- | Initial model with all fields zeroed out.
@@ -45,6 +46,7 @@ initialModel = Model
   , lastMouseY   = 0
   , isLoading    = False
   , selectedDesc = ""
+  , showPaper    = False
   }
 
 -- ---------------------------------------------------------------------------
@@ -66,4 +68,5 @@ data Action
   | StopDrag
   | WheelZoom Float Float Float
   | ResetViewport
+  | TogglePaper
   deriving (Show, Eq)

@@ -28,6 +28,7 @@ viewModel Model {..} = div_ []
       [ editorPanel
       , outputPanel
       ]
+  , if showPaper then paperOverlay else text ""
   ]
   where
     -- =======================================================================
@@ -84,6 +85,20 @@ viewModel Model {..} = div_ []
                  \GHCJS and provides an Elm-like architecture for building \
                  \reactive web apps entirely in Haskell. Huge thanks to the \
                  \Miso team for making this kind of thing feasible!"
+          ]
+      , p_ [ style_ (mconcat [ "color" =: "#666"
+                              , "font-size" =: "13px"
+                              , "line-height" =: "1.5"
+                              , "margin-bottom" =: "16px" ]) ]
+          [ text "For the full story behind this project, "
+          , a_ [ onClick TogglePaper
+               , style_ (mconcat [ "color" =: "#2980b9"
+                                  , "text-decoration" =: "none"
+                                  , "cursor" =: "pointer"
+                                  , "border-bottom" =: "1px dashed #2980b9"
+                                  ]) ]
+              [ text "read the academic paper" ]
+          , text "."
           ]
       ]
 
@@ -265,4 +280,69 @@ viewModel Model {..} = div_ []
         , span_ [ style_ (mconcat [ "color" =: "#666"
                                    , "font-size" =: "14px" ]) ]
             [ text "Evaluating DSL..." ]
+        ]
+
+    -- =======================================================================
+    -- PDF paper overlay
+    -- =======================================================================
+    paperOverlay :: View Action
+    paperOverlay =
+      div_ [ style_ (mconcat [ "position" =: "fixed"
+                              , "top" =: "0", "left" =: "0"
+                              , "width" =: "100vw", "height" =: "100vh"
+                              , "background-color" =: "rgba(0,0,0,0.7)"
+                              , "display" =: "flex"
+                              , "flex-direction" =: "column"
+                              , "align-items" =: "center"
+                              , "justify-content" =: "center"
+                              , "z-index" =: "9999"
+                              ]) ]
+        [ -- Header bar with title and close button
+          div_ [ style_ (mconcat [ "width" =: "90%"
+                                  , "max-width" =: "900px"
+                                  , "display" =: "flex"
+                                  , "justify-content" =: "space-between"
+                                  , "align-items" =: "center"
+                                  , "margin-bottom" =: "8px"
+                                  ]) ]
+            [ span_ [ style_ (mconcat [ "color" =: "#fff"
+                                       , "font-size" =: "16px"
+                                       , "font-family" =: "Arial, sans-serif" ]) ]
+                [ text "Academic Paper \x2014 The Terrible Tiling Toolkit" ]
+            , div_ [ style_ (mconcat [ "display" =: "flex"
+                                      , "gap" =: "8px" ]) ]
+                [ a_ [ href_ "TTT.pdf"
+                     , textProp "target" "_blank"
+                     , style_ (mconcat [ "color" =: "#fff"
+                                        , "font-size" =: "14px"
+                                        , "text-decoration" =: "none"
+                                        , "padding" =: "6px 14px"
+                                        , "border" =: "1px solid #fff"
+                                        , "border-radius" =: "4px"
+                                        , "font-family" =: "Arial, sans-serif"
+                                        ]) ]
+                    [ text "Open in new tab" ]
+                , button_ [ onClick TogglePaper
+                          , style_ (mconcat [ "padding" =: "6px 14px"
+                                            , "background-color" =: "#e74c3c"
+                                            , "color" =: "white"
+                                            , "border" =: "none"
+                                            , "border-radius" =: "4px"
+                                            , "cursor" =: "pointer"
+                                            , "font-size" =: "14px"
+                                            ]) ]
+                    [ text "Close" ]
+                ]
+            ]
+        , -- PDF iframe
+          node HTML (ms ("iframe" :: String)) Nothing
+            [ textProp "src" "TTT.pdf"
+            , style_ (mconcat [ "width" =: "90%"
+                              , "max-width" =: "900px"
+                              , "height" =: "85vh"
+                              , "border" =: "none"
+                              , "border-radius" =: "6px"
+                              , "background-color" =: "#fff"
+                              ]) ]
+            []
         ]
